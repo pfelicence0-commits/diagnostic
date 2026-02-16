@@ -45,7 +45,6 @@ const MesImages = () => {
     if (storedUser) {
       const userProfile = JSON.parse(storedUser);
       setCurrentUser(userProfile);
-      console.log('Utilisateur chargé depuis localStorage:', userProfile);
     }
     
     setSessionMode(storedMode || 'solo');
@@ -53,7 +52,6 @@ const MesImages = () => {
     if (storedCollab) {
       const collabProfile = JSON.parse(storedCollab);
       setCollaborator(collabProfile);
-      console.log('Collaborateur chargé:', collabProfile);
     }
   }, []);
 
@@ -88,7 +86,6 @@ const MesImages = () => {
     if (error) {
       console.error("Erreur Fetch:", error.message);
     } else {
-      console.log('Données récupérées:', data);
       setAllDataGrouped(groupData(data));
     }
   };
@@ -98,17 +95,28 @@ const MesImages = () => {
       fetchData();
     }
   }, [currentUserId]);
-
   const getAvisStatus = (group) => {
-    if (group.avis.length < 2) return 'pending';
-    const counts = group.avis.reduce((acc, avis) => {
-      const key = avis.maladie_nom || '';
-      acc[key] = (acc[key] || 0) + 1;
-      return acc;
-    }, {});
-    const maxCount = Math.max(...Object.values(counts));
-    return maxCount >= 2 ? 'validated' : 'divergent';
-  };
+  const avis = group.avis;
+  if (avis.length < 2) return 'pending';
+
+  // 1. On compte le nombre d'occurrences pour chaque combinaison Maladie + Stade
+  const counts = {};
+  
+  avis.forEach(item => {
+    // On crée une clé unique pour comparer (ex: "OMA-Suppurée")
+    const key = `${item.maladie_nom}-${item.stade_nom}`;
+    counts[key] = (counts[key] || 0) + 1;
+  });
+
+  // 2. On cherche si une combinaison a été choisie par au moins 2 médecins
+  const hasConsensus = Object.values(counts).some(count => count >= 2);
+
+  if (hasConsensus) {
+    return 'validated'; // Passe en violet/vert car au moins 2 sont d'accord
+  } else {
+    return 'divergent'; // Reste en rouge car tout le monde dit des choses différentes
+  }
+};
 
   const myGroups = allDataGrouped.filter(g => 
     g.avis.some(a => a.utilisateur_id === currentUserId)
@@ -128,10 +136,7 @@ const MesImages = () => {
   });
 
   const verifyPassword = async (pwd) => {
-    if (!currentUser?.email) {
-      console.error('Pas d\'email disponible pour la vérification');
-      return false;
-    }
+    if (!currentUser?.email) return false;
     const { error } = await supabase.auth.signInWithPassword({
       email: currentUser.email,
       password: pwd
@@ -178,28 +183,45 @@ const MesImages = () => {
       } else {
         const originalFileName = selectedGroup.avis[0]?.nom_image_originale || "Non défini";
         const renamedFileName = selectedGroup.avis[0]?.nom_image_renommee || "";
+        const today = new Date().toISOString().split('T')[0];
 
-        console.log('Contribution - Médecin:', doctorDisplayName);
+        // Préparation des données à insérer
+        const rowsToInsert = [{
+          image_hash: selectedGroup.image_hash,
+          image_url: selectedGroup.image_url,
+          maladie_nom: newDiseaseName,
+          stade_nom: newDiseaseType,
+          utilisateur_id: currentUserId,
+          nom_medecin_diagnostiqueur: doctorDisplayName,
+          nom_image_originale: originalFileName,
+          nom_image_renommee: renamedFileName,
+          date_diagnostique: today
+        }];
 
-        const { error } = await supabase
-          .from('categories_diagnostics')
-          .insert([{
+        // Ajout de l'avis du collaborateur si on est en mode collaboration
+        if (sessionMode === 'collaboration' && collaborator) {
+          rowsToInsert.push({
             image_hash: selectedGroup.image_hash,
             image_url: selectedGroup.image_url,
             maladie_nom: newDiseaseName,
             stade_nom: newDiseaseType,
-            utilisateur_id: currentUserId,
-            nom_medecin_diagnostiqueur: doctorDisplayName,
+            utilisateur_id: collaborator.id,
+            nom_medecin_diagnostiqueur: `${collaborator.prenom} ${collaborator.nom}`.trim(),
             nom_image_originale: originalFileName,
             nom_image_renommee: renamedFileName,
-            date_diagnostique: new Date().toISOString().split('T')[0]
-          }]);
+            date_diagnostique: today
+          });
+        }
+
+        const { error } = await supabase
+          .from('categories_diagnostics')
+          .insert(rowsToInsert);
         if (error) throw error;
       }
       setShowModal(false); 
       fetchData();
     } catch (err) {
-      console.error('Erreur lors de l\'enregistrement:', err);
+      console.error(err);
       setError("Erreur lors de l'enregistrement.");
     }
   };
@@ -218,7 +240,6 @@ const MesImages = () => {
       .eq('id', deleteTarget.id);
 
     if (error) {
-      console.error('Erreur de suppression:', error);
       setDeleteError("Erreur de suppression.");
     } else {
       setShowDeleteModal(false); 
@@ -245,7 +266,6 @@ const MesImages = () => {
           </div>
         </header>
 
-        {/* Affichage du médecin connecté ET collaborateur */}
         <div className="mb-6 p-4 bg-cyan-500/10 rounded-2xl border border-cyan-500/30">
           <p className="text-[10px] font-bold text-cyan-400 uppercase">
             {sessionMode === 'collaboration' ? 'Session Collaborative' : 'Médecin connecté'}
@@ -267,7 +287,6 @@ const MesImages = () => {
           </div>
         </div>
 
-        {/* FILTRES */}
         <div className="flex flex-col md:flex-row gap-4 mb-8">
           <div className="flex-1">
             <label className="text-[10px] font-black text-slate-500 uppercase ml-2 mb-1 block">Filtrer par Maladie</label>
@@ -285,7 +304,6 @@ const MesImages = () => {
           </div>
         </div>
 
-        {/* GRILLE */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
           {filteredData.map(group => {
             const status = getAvisStatus(group);
@@ -326,7 +344,6 @@ const MesImages = () => {
         </div>
       </div>
 
-      {/* MODALE ÉDITION / AJOUT */}
       {showModal && (
         <div className="fixed inset-0 bg-black/90 backdrop-blur-sm flex items-center justify-center z-50 p-4">
           <div className="bg-slate-800 p-8 rounded-[2.5rem] w-full max-w-sm border border-white/10 shadow-2xl">
@@ -335,7 +352,6 @@ const MesImages = () => {
             </h2>
             {step === 1 ? (
               <div className="space-y-6">
-                {/* ALERTE MODIFICATION */}
                 {modalMode === 'edit' && (
                   <div className="flex items-start gap-3 p-4 bg-blue-500/10 border border-blue-500/30 rounded-2xl">
                     <Info size={20} className="text-blue-400 flex-shrink-0 mt-0.5" />
@@ -345,7 +361,6 @@ const MesImages = () => {
                     </div>
                   </div>
                 )}
-                
                 <div className="space-y-2">
                   <label className="text-[10px] font-black text-slate-500 uppercase ml-2">Pathologie</label>
                   <select value={newDiseaseName} onChange={(e) => { setNewDiseaseName(e.target.value); setNewDiseaseType('Standard'); }} className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none">
@@ -379,40 +394,23 @@ const MesImages = () => {
         </div>
       )}
 
-      {/* MODALE SUPPRESSION AVEC ALERTE */}
       {showDeleteModal && (
         <div className="fixed inset-0 bg-black/90 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-slate-800 p-8 rounded-[2.5rem] w-full max-w-md border border-red-500/20">
             <h2 className="text-xl font-black text-red-500 mb-6 text-center uppercase">Supprimer le diagnostic ?</h2>
-            
-            {/* ALERTE SUPPRESSION */}
             <div className="flex items-start gap-3 p-4 bg-red-500/10 border border-red-500/30 rounded-2xl mb-6">
               <AlertTriangle size={24} className="text-red-400 flex-shrink-0 mt-0.5" />
               <div>
                 <p className="text-xs font-bold text-red-400 uppercase mb-2">⚠️ Attention</p>
-                <p className="text-sm text-red-300 mb-2">
-                  L'image source sera <span className="font-bold">définitivement supprimée</span> de la base de données.
-                </p>
-                <p className="text-xs text-red-400">
-                  Cette action est <span className="font-bold">irréversible</span>.
-                </p>
+                <p className="text-sm text-red-300 mb-2">L'image source sera <span className="font-bold">définitivement supprimée</span>.</p>
+                <p className="text-xs text-red-400">Cette action est <span className="font-bold">irréversible</span>.</p>
               </div>
             </div>
-            
-            <input 
-              type="password" 
-              value={deletePassword} 
-              onChange={(e) => setDeletePassword(e.target.value)} 
-              placeholder="Mot de passe pour confirmer" 
-              className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-center mb-4" 
-              autoFocus 
-            />
-            
+            <input type="password" value={deletePassword} onChange={(e) => setDeletePassword(e.target.value)} placeholder="Mot de passe" className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-center mb-4" autoFocus />
             {deleteError && <p className="text-red-400 text-xs text-center mb-4 font-bold uppercase">{deleteError}</p>}
-            
             <div className="flex gap-4">
               <button onClick={() => setShowDeleteModal(false)} className="flex-1 py-5 bg-slate-700 rounded-2xl font-black uppercase text-xs hover:bg-slate-600">Annuler</button>
-              <button onClick={handleDeleteConfirm} className="flex-1 py-5 bg-red-600 rounded-2xl font-black uppercase text-xs hover:bg-red-500">Confirmer la suppression</button>
+              <button onClick={handleDeleteConfirm} className="flex-1 py-5 bg-red-600 rounded-2xl font-black uppercase text-xs hover:bg-red-500">Confirmer</button>
             </div>
           </div>
         </div>
