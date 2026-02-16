@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, Activity, Image as ImageIcon, CheckCircle2 } from 'lucide-react';
+import { Upload, Activity, Image as ImageIcon, CheckCircle2, X } from 'lucide-react';
 import GlobalMenu from '../components/GlobalMenu';
 import { supabase } from '../supabaseClient'; 
-import UTIF from 'utif'; 
+import UTIF from 'utif';
 
 const categoryOptions = [
   { name: 'OMA', fullName: 'Otite Moyenne Aiguë', options: ['Congestive', 'Suppurée', 'Perforée'], icon: '🔴' },
@@ -363,18 +363,47 @@ export default function Accueil() {
     }
   };
 
- return (
+  return (
     <div className="h-screen flex flex-col bg-[#0f172a] text-white overflow-hidden">
       <GlobalMenu />
       
-      {/* Conteneur principal avec hauteur fixe pour empêcher le scroll de la page entière */}
       <div className="flex flex-1 p-6 gap-6 mt-14 overflow-hidden h-[calc(100vh-60px)]">
         
-        {/* 1. FILE D'ATTENTE */}
+        {/* FILE D'ATTENTE */}
         <div className="w-80 bg-slate-800/50 rounded-3xl border border-white/10 p-4 flex flex-col h-full">
-          <div className="flex items-center gap-2 border-b border-white/10 pb-3 shrink-0">
-            <ImageIcon size={18} className="text-cyan-400" />
-            <h2 className="text-xs font-bold uppercase tracking-widest">File d'attente</h2>
+          <div className="flex items-center justify-between border-b border-white/10 pb-3 shrink-0">
+            <div className="flex items-center gap-2">
+              <ImageIcon size={18} className="text-cyan-400" />
+              <h2 className="text-xs font-bold uppercase tracking-widest">File d'attente</h2>
+              {fileQueue.length > 0 && (
+                <span className="bg-cyan-500/20 text-cyan-400 px-2 py-0.5 rounded-full text-[10px] font-bold">
+                  {fileQueue.filter(f => f.status === 'uploaded').length}/{fileQueue.length}
+                </span>
+              )}
+            </div>
+            {fileQueue.length > 0 && (
+              <button
+                onClick={() => {
+                  const pendingCount = fileQueue.filter(f => f.status === 'pending').length;
+                  const message = pendingCount > 0 
+                    ? `${pendingCount} image(s) non validée(s) seront perdues. Continuer ?`
+                    : 'Vider la file d\'attente ?';
+                  
+                  if (window.confirm(message)) {
+                    setFileQueue([]);
+                    setCurrentIndex(null);
+                    setSelectedFile(null);
+                    setSelectedImage(null);
+                    setSelections({});
+                    setSaveMessage('');
+                  }
+                }}
+                className="p-2 hover:bg-red-500/20 rounded-lg transition-all group"
+                title="Vider et changer de dossier"
+              >
+                <X size={16} className="text-slate-400 group-hover:text-red-400 transition-colors" />
+              </button>
+            )}
           </div>
           <div className="flex-1 overflow-y-auto mt-4 space-y-3 custom-scrollbar">
             {isLoadingImages && (
@@ -400,85 +429,76 @@ export default function Accueil() {
         </div>
 
         {/* COLONNE DIAGNOSTIC */}
-        <div className="w-[400px] bg-slate-800/30 rounded-3xl p-6 border border-white/10 flex flex-col h-full overflow-hidden">
+        <div className="w-[400px] bg-slate-800/30 rounded-3xl p-6 border border-white/10 flex flex-col h-full">
           <h3 className="text-[10px] font-black text-slate-500 uppercase mb-6 tracking-widest shrink-0">Diagnostic</h3>
           
           <div className="flex-1 overflow-y-auto custom-scrollbar pr-2">
-            {/* Affichage des médecins avec sécurité */}
-            <div className="mb-6 p-4 bg-cyan-500/10 rounded-2xl border border-cyan-500/30">
-              <p className="text-[10px] font-bold text-cyan-400 uppercase mb-1">
-                {sessionMode === 'collaboration' ? 'Session Collaborative' : 'Médecin connecté'}
-              </p>
-              <div className="flex items-center gap-3">
-                <div className="flex-1">
-                  <p className="text-[9px] text-slate-400 mb-1">Médecin 1</p>
-                  <p className="text-sm font-bold text-white">
-                    {currentUser ? `Dr. ${currentUser.prenom} ${currentUser.nom}` : "Chargement..."}
-                  </p>
-                </div>
-                {sessionMode === 'collaboration' && collaborator && (
-                  <>
-                    <div className="w-px h-10 bg-slate-600"></div>
-                    <div className="flex-1">
-                      <p className="text-[9px] text-blue-400 mb-1">Médecin 2</p>
-                      <p className="text-sm font-bold text-white">Dr. {collaborator.prenom} {collaborator.nom}</p>
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* Liste des catégories avec vérification de présence */}
-            <div className="space-y-3">
-              {categoryOptions && categoryOptions.length > 0 ? (
-                categoryOptions.map((cat, idx) => (
-                  <div key={idx} className={`p-4 border rounded-2xl transition-all ${selections[cat.name] ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
-                    <div className="flex items-center gap-4">
-                      <span className="text-xl">{cat.icon}</span>
-                      <div className="flex-1">
-                        <div className="text-xs font-bold">{cat.name}</div>
-                        <div className="text-[9px] text-slate-400 uppercase">{cat.fullName}</div>
-                      </div>
-                      <input 
-                        type="checkbox" 
-                        className="w-5 h-5 accent-cyan-400 cursor-pointer" 
-                        checked={!!selections[cat.name]} 
-                        onChange={(e) => {
-                          const newSels = {...selections};
-                          if(e.target.checked) newSels[cat.name] = {stage: 'Aucun'};
-                          else delete newSels[cat.name];
-                          setSelections(newSels);
-                        }} 
-                      />
-                    </div>
-                    {selections[cat.name] && cat.options[0] !== 'Aucun' && (
-                      <select 
-                        className="mt-3 bg-slate-900 text-[10px] p-3 rounded-xl border border-cyan-500/30 w-full text-white"
-                        value={selections[cat.name].stage}
-                        onChange={(e) => setSelections({...selections, [cat.name]: {stage: e.target.value}})}
-                      >
-                        <option value="Aucun">Stade...</option>
-                        {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
-                      </select>
-                    )}
+            {currentUser && (
+              <div className="mb-6 p-4 bg-cyan-500/10 rounded-2xl border border-cyan-500/30">
+                <p className="text-[10px] font-bold text-cyan-400 uppercase mb-1">
+                  {sessionMode === 'collaboration' ? 'Session Collaborative' : 'Médecin connecté'}
+                </p>
+                <div className="flex items-center gap-3">
+                  <div className="flex-1">
+                    <p className="text-[9px] text-slate-400 mb-1">Médecin 1</p>
+                    <p className="text-sm font-bold text-white">Dr. {currentUser.prenom} {currentUser.nom}</p>
                   </div>
-                ))
-              ) : (
-                <div className="text-center p-10">
-                  <p className="text-red-400 text-xs">⚠️ Erreur : Liste de diagnostic manquante</p>
+                  {sessionMode === 'collaboration' && collaborator && (
+                    <>
+                      <div className="w-px h-10 bg-slate-600"></div>
+                      <div className="flex-1">
+                        <p className="text-[9px] text-blue-400 mb-1">Médecin 2</p>
+                        <p className="text-sm font-bold text-white">Dr. {collaborator.prenom} {collaborator.nom}</p>
+                      </div>
+                    </>
+                  )}
                 </div>
-              )}
+              </div>
+            )}
+
+            <div className="space-y-3">
+              {categoryOptions.map((cat, idx) => (
+                <div key={idx} className={`p-4 border rounded-2xl transition-all ${selections[cat.name] ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
+                  <div className="flex items-center gap-4">
+                    <span className="text-xl">{cat.icon}</span>
+                    <div className="flex-1">
+                      <div className="text-xs font-bold">{cat.name}</div>
+                      <div className="text-[9px] text-slate-400 uppercase">{cat.fullName}</div>
+                    </div>
+                    <input 
+                      type="checkbox" 
+                      className="w-5 h-5 accent-cyan-400" 
+                      checked={!!selections[cat.name]} 
+                      onChange={(e) => {
+                        const newSels = {...selections};
+                        if(e.target.checked) newSels[cat.name] = {stage: 'Aucun'};
+                        else delete newSels[cat.name];
+                        setSelections(newSels);
+                      }} 
+                    />
+                  </div>
+                  {selections[cat.name] && cat.options[0] !== 'Aucun' && (
+                    <select 
+                      className="mt-3 bg-slate-900 text-[10px] p-3 rounded-xl border border-cyan-500/30 w-full text-white"
+                      value={selections[cat.name].stage}
+                      onChange={(e) => setSelections({...selections, [cat.name]: {stage: e.target.value}})}
+                    >
+                      <option value="Aucun">Stade...</option>
+                      {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         </div>
 
-        {/* 3. COLONNE IMAGE + BOUTON (CORRIGÉE) */}
+        {/* COLONNE IMAGE + BOUTON */}
         <div className="flex-1 flex flex-col h-full min-h-0">
           
-          {/* Zone Image : flex-1 et min-h-0 sont cruciaux pour que l'image s'adapte à l'écran */}
-          <div className="flex-1 min-h-0 bg-slate-900/50 border-2 border-dashed border-white/5 rounded-[2.5rem] flex items-center justify-center relative overflow-hidden mb-4">
+          <div className="flex-1 bg-slate-900/50 border-2 border-dashed border-white/5 rounded-[2.5rem] flex items-center justify-center relative overflow-hidden mb-4">
             {!selectedImage ? (
-              <label className="cursor-pointer text-center p-10">
+              <label className="cursor-pointer text-center">
                 <Upload className="text-cyan-400 mx-auto mb-4" size={32} />
                 <p className="font-black uppercase text-[10px] text-slate-400">Charger dossier</p>
                 <input type="file" className="hidden" webkitdirectory="true" directory="true" multiple onChange={handleFolderChange} />
@@ -486,32 +506,25 @@ export default function Accueil() {
             ) : (
               <img 
                 src={selectedImage} 
-                className="max-h-full max-w-full object-contain p-2" 
+                className="max-h-full max-w-full object-contain" 
                 alt="Vue" 
               />
             )}
-            {isLoadingImages && (
-              <div className="absolute inset-0 bg-slate-900/80 flex flex-col items-center justify-center rounded-[2.5rem]">
-                <Activity className="animate-spin text-cyan-400 mb-2" size={40} />
-                <p className="text-[10px] uppercase tracking-widest text-cyan-400">Traitement TIFF...</p>
-              </div>
-            )}
           </div>
 
-          {/* Zone Bouton : shrink-0 empêche le bouton de disparaître ou de rétrécir */}
           <div className="shrink-0">
             <button 
               onClick={handleUpload} 
               disabled={isSaving || isLoadingImages || !selectedFile || Object.keys(selections).length === 0} 
               className={`w-full py-5 rounded-[2rem] font-black text-xs uppercase tracking-widest transition-all ${
-                (isSaving || isLoadingImages) ? 'bg-slate-700 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 active:scale-95 shadow-lg shadow-cyan-900/20'
+                (isSaving || isLoadingImages) ? 'bg-slate-700 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 active:scale-95'
               }`}
             >
               {isSaving ? <Activity className="animate-spin mx-auto" /> : 'Valider le diagnostic'}
             </button>
             
             {saveMessage && (
-              <div className="mt-3 p-3 rounded-2xl text-center text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 animate-pulse">
+              <div className="mt-3 p-3 rounded-2xl text-center text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
                 {saveMessage}
               </div>
             )}
