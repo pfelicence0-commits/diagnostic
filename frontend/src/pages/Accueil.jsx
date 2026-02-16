@@ -254,114 +254,133 @@ export default function Accueil() {
     }
   };
 
-  return (
-    <div className="min-h-screen flex flex-col bg-[#0f172a] text-white">
-      <GlobalMenu />
+return (
+  <div className="h-screen flex flex-col bg-[#0f172a] text-white overflow-hidden">
+    <GlobalMenu />
+    
+    {/* Conteneur Principal : on force h-full et on empêche le scroll global */}
+    <div className="flex flex-1 p-6 gap-6 mt-14 overflow-hidden h-[calc(100vh-60px)]">
       
-      <div className="flex flex-1 p-6 gap-6 mt-14 overflow-hidden h-[calc(100vh-60px)]">
+      {/* 1. FILE D'ATTENTE (Gauche) - Inchangé mais vérifié */}
+      <div className="w-80 bg-slate-800/50 rounded-3xl border border-white/10 p-4 flex flex-col h-full">
+        <div className="flex items-center gap-2 border-b border-white/10 pb-3 shrink-0">
+          <ImageIcon size={18} className="text-cyan-400" />
+          <h2 className="text-xs font-bold uppercase tracking-widest">File d'attente</h2>
+        </div>
+        <div className="flex-1 overflow-y-auto mt-4 space-y-3 custom-scrollbar">
+          {fileQueue.map((item, idx) => (
+            <div 
+              key={idx} 
+              onClick={() => { if (!isSaving) { setCurrentIndex(idx); setSelectedFile(item.file); setSelectedImage(item.preview); }}} 
+              className={`relative cursor-pointer rounded-2xl overflow-hidden border-2 transition-all ${currentIndex === idx ? 'border-cyan-400' : 'border-transparent opacity-50'}`}
+            >
+              <img src={item.preview} alt="mini" className="w-full h-24 object-cover" />
+              {item.status === 'uploaded' && (
+                <div className="absolute inset-0 bg-green-500/60 flex items-center justify-center">
+                  <CheckCircle2 size={30} className="text-white" />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* 2. COLONNE CENTRALE (Diagnostic) */}
+      <div className="w-[400px] bg-slate-800/30 rounded-3xl p-6 border border-white/10 flex flex-col h-full">
+        <h3 className="text-[10px] font-black text-slate-500 uppercase mb-6 tracking-widest shrink-0">Diagnostic</h3>
         
-        {/* FILE D'ATTENTE */}
-        <div className="w-80 bg-slate-800/50 rounded-3xl border border-white/10 p-4 flex flex-col gap-4">
-          <div className="flex items-center gap-2 border-b border-white/10 pb-3">
-            <ImageIcon size={18} className="text-cyan-400" />
-            <h2 className="text-xs font-bold uppercase tracking-widest">File d'attente</h2>
-          </div>
-          <div className="flex-1 overflow-y-auto space-y-3 custom-scrollbar">
-            {fileQueue.map((item, idx) => (
-              <div 
-                key={idx} 
-                onClick={() => { if (!isSaving) { setCurrentIndex(idx); setSelectedFile(item.file); setSelectedImage(item.preview); }}} 
-                className={`relative cursor-pointer rounded-2xl overflow-hidden border-2 transition-all ${currentIndex === idx ? 'border-cyan-400' : 'border-transparent opacity-50'}`}
-              >
-                <img src={item.preview} alt="mini" className="w-full h-24 object-cover" />
-                {item.status === 'uploaded' && (
-                  <div className="absolute inset-0 bg-green-500/60 flex items-center justify-center">
-                    <CheckCircle2 size={30} className="text-white" />
+        {/* Zone scrollable pour le diagnostic si la liste est longue */}
+        <div className="flex-1 overflow-y-auto custom-scrollbar pr-2">
+          {currentUser && (
+            <div className="mb-6 p-4 bg-cyan-500/10 rounded-2xl border border-cyan-500/30">
+              <p className="text-[10px] font-bold text-cyan-400 uppercase mb-1">Médecin 1</p>
+              <p className="text-sm font-bold text-white">Dr. {currentUser.prenom} {currentUser.nom}</p>
+              {sessionMode === 'collaboration' && collaborator && (
+                <>
+                  <p className="text-[10px] font-bold text-blue-400 uppercase mt-3 mb-1">Médecin 2</p>
+                  <p className="text-sm font-bold text-white">Dr. {collaborator.prenom} {collaborator.nom}</p>
+                </>
+              )}
+            </div>
+          )}
+
+          <div className="space-y-3">
+            {categoryOptions.map((cat, idx) => (
+              <div key={idx} className={`p-4 border rounded-2xl transition-all ${selections[cat.name] ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
+                <div className="flex items-center gap-4">
+                  <span className="text-xl">{cat.icon}</span>
+                  <div className="flex-1">
+                    <div className="text-xs font-bold">{cat.name}</div>
+                    <div className="text-[9px] text-slate-400 uppercase">{cat.fullName}</div>
                   </div>
+                  <input 
+                    type="checkbox" 
+                    className="w-5 h-5 accent-cyan-400" 
+                    checked={!!selections[cat.name]} 
+                    onChange={(e) => {
+                      const newSels = {...selections};
+                      if(e.target.checked) newSels[cat.name] = {stage: 'Aucun'};
+                      else delete newSels[cat.name];
+                      setSelections(newSels);
+                    }} 
+                  />
+                </div>
+                {selections[cat.name] && cat.options[0] !== 'Aucun' && (
+                  <select 
+                    className="mt-3 bg-slate-900 text-[10px] p-3 rounded-xl border border-cyan-500/30 w-full text-white"
+                    value={selections[cat.name].stage}
+                    onChange={(e) => setSelections({...selections, [cat.name]: {stage: e.target.value}})}
+                  >
+                    <option value="Aucun">Stade...</option>
+                    {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
+                  </select>
                 )}
               </div>
             ))}
           </div>
         </div>
+      </div>
 
-        {/* DIAGNOSTIC ET VISUALISATION */}
-        <div className="flex-1 flex gap-6">
-          <div className="w-[400px] bg-slate-800/30 rounded-3xl p-6 border border-white/10 overflow-y-auto custom-scrollbar">
-            <h3 className="text-[10px] font-black text-slate-500 uppercase mb-6 tracking-widest">Diagnostic</h3>
-            
-            {/* Affichage du médecin connecté */}
-            {currentUser && (
-              <div className="mb-6 p-4 bg-cyan-500/10 rounded-2xl border border-cyan-500/30">
-                <p className="text-[10px] font-bold text-cyan-400 uppercase mb-1">Médecin 1</p>
-                <p className="text-sm font-bold text-white">Dr. {currentUser.prenom} {currentUser.nom}</p>
-                {sessionMode === 'collaboration' && collaborator && (
-                  <>
-                    <p className="text-[10px] font-bold text-blue-400 uppercase mt-3 mb-1">Médecin 2</p>
-                    <p className="text-sm font-bold text-white">Dr. {collaborator.prenom} {collaborator.nom}</p>
-                  </>
-                )}
-              </div>
-            )}
-
-            <div className="space-y-3">
-              {categoryOptions.map((cat, idx) => (
-                <div key={idx} className={`p-4 border rounded-2xl transition-all ${selections[cat.name] ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
-                  <div className="flex items-center gap-4">
-                    <span className="text-xl">{cat.icon}</span>
-                    <div className="flex-1">
-                      <div className="text-xs font-bold">{cat.name}</div>
-                      <div className="text-[9px] text-slate-400 uppercase">{cat.fullName}</div>
-                    </div>
-                    <input 
-                      type="checkbox" 
-                      className="w-5 h-5 accent-cyan-400" 
-                      checked={!!selections[cat.name]} 
-                      onChange={(e) => {
-                        const newSels = {...selections};
-                        if(e.target.checked) newSels[cat.name] = {stage: 'Aucun'};
-                        else delete newSels[cat.name];
-                        setSelections(newSels);
-                      }} 
-                    />
-                  </div>
-                  {selections[cat.name] && cat.options[0] !== 'Aucun' && (
-                    <select 
-                      className="mt-3 bg-slate-900 text-[10px] p-3 rounded-xl border border-cyan-500/30 w-full"
-                      value={selections[cat.name].stage}
-                      onChange={(e) => setSelections({...selections, [cat.name]: {stage: e.target.value}})}
-                    >
-                      <option value="Aucun">Stade...</option>
-                      {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
-                    </select>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex-1 flex flex-col gap-4">
-            <div className="flex-1 bg-slate-900/50 border-2 border-dashed border-white/5 rounded-[2.5rem] flex items-center justify-center relative overflow-hidden">
-              {!selectedImage ? (
-                <label className="cursor-pointer text-center">
-                  <Upload className="text-cyan-400 mx-auto mb-4" size={32} />
-                  <p className="font-black uppercase text-[10px] text-slate-400">Charger dossier</p>
-                  <input type="file" className="hidden" webkitdirectory="true" directory="true" multiple onChange={handleFolderChange} />
-                </label>
-              ) : (
-                <img src={selectedImage} className="max-h-full max-w-full object-contain" alt="Vue" />
-              )}
-            </div>
-            <button 
-              onClick={handleUpload} 
-              disabled={isSaving || !selectedFile || Object.keys(selections).length === 0} 
-              className={`w-full py-6 rounded-[2rem] font-black text-xs uppercase tracking-widest ${isSaving ? 'bg-slate-700' : 'bg-cyan-600 hover:bg-cyan-500'}`}
-            >
-              {isSaving ? <Activity className="animate-spin mx-auto" /> : 'Valider'}
-            </button>
-            {saveMessage && <div className="p-4 rounded-2xl text-center text-[10px] bg-cyan-500/10 text-cyan-400">{saveMessage}</div>}
-          </div>
+      {/* 3. COLONNE DE DROITE (Image + Bouton) - LA CORRECTION EST ICI */}
+      <div className="flex-1 flex flex-col h-full min-h-0">
+        
+        {/* Zone Image : flex-1 et overflow-hidden sont vitaux ici */}
+        <div className="flex-1 bg-slate-900/50 border-2 border-dashed border-white/5 rounded-[2.5rem] flex items-center justify-center relative overflow-hidden mb-4">
+          {!selectedImage ? (
+            <label className="cursor-pointer text-center">
+              <Upload className="text-cyan-400 mx-auto mb-4" size={32} />
+              <p className="font-black uppercase text-[10px] text-slate-400">Charger dossier</p>
+              <input type="file" className="hidden" webkitdirectory="true" directory="true" multiple onChange={handleFolderChange} />
+            </label>
+          ) : (
+            <img 
+              src={selectedImage} 
+              className="max-h-full max-w-full object-contain" 
+              alt="Vue" 
+            />
+          )}
         </div>
+
+        {/* Zone Bouton : Toujours ancrée en bas, elle ne bouge pas */}
+        <div className="shrink-0">
+          <button 
+            onClick={handleUpload} 
+            disabled={isSaving || !selectedFile || Object.keys(selections).length === 0} 
+            className={`w-full py-5 rounded-[2rem] font-black text-xs uppercase tracking-widest transition-all ${
+              isSaving ? 'bg-slate-700 cursor-not-allowed' : 'bg-cyan-600 hover:bg-cyan-500 active:scale-95'
+            }`}
+          >
+            {isSaving ? <Activity className="animate-spin mx-auto" /> : 'Valider le diagnostic'}
+          </button>
+          
+          {saveMessage && (
+            <div className="mt-3 p-3 rounded-2xl text-center text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+              {saveMessage}
+            </div>
+          )}
+        </div>
+
       </div>
     </div>
-  );
-}
+  </div>
+); }
