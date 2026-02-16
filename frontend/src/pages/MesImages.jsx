@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Edit, Image as ImageIcon, Trash2, CheckCircle, X, AlertTriangle, Info } from 'lucide-react';
 import GlobalMenu from '../components/GlobalMenu';
 import { supabase } from '../supabaseClient';
+import UTIF from 'utif';
 
 const categoryOptions = [
   { name: 'OMA', fullName: 'Otite Moyenne Aiguë', options: ['Congestive', 'Suppurée', 'Perforée'] },
@@ -36,6 +37,9 @@ const MesImages = () => {
   const [currentUser, setCurrentUser] = useState(null);
   const [sessionMode, setSessionMode] = useState('solo');
   const [collaborator, setCollaborator] = useState(null);
+  
+  // Cache pour les images converties
+  const [convertedImages, setConvertedImages] = useState({});
 
   useEffect(() => {
     const storedUser = localStorage.getItem("user");
@@ -59,6 +63,100 @@ const MesImages = () => {
   const doctorDisplayName = currentUser 
     ? `${currentUser.prenom || ''} ${currentUser.nom || ''}`.trim() 
     : "Médecin non identifié";
+
+  // Fonction pour convertir une URL TIF en PNG
+  const convertTiffUrl = async (url) => {
+    // Vérifier si déjà converti
+    if (convertedImages[url]) {
+      return convertedImages[url];
+    }
+
+    try {
+      console.log('🔄 Conversion TIF depuis URL:', url);
+      
+      // Télécharger l'image TIF
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const arrayBuffer = await blob.arrayBuffer();
+      
+      // Décoder avec UTIF
+      const ifds = UTIF.decode(arrayBuffer);
+      if (!ifds || ifds.length === 0) {
+        throw new Error('Impossible de décoder le TIFF');
+      }
+      
+      UTIF.decodeImage(arrayBuffer, ifds[0]);
+      const ifd = ifds[0];
+      
+      // Créer un canvas
+      const canvas = document.createElement('canvas');
+      canvas.width = ifd.width;
+      canvas.height = ifd.height;
+      const ctx = canvas.getContext('2d');
+      
+      // Convertir en RGBA
+      const rgba = UTIF.toRGBA8(ifd);
+      const imageData = new ImageData(
+        new Uint8ClampedArray(rgba),
+        ifd.width,
+        ifd.height
+      );
+      ctx.putImageData(imageData, 0, 0);
+      
+      // Convertir en PNG
+      const pngDataUrl = canvas.toDataURL('image/png', 1.0);
+      
+      // Mettre en cache
+      setConvertedImages(prev => ({ ...prev, [url]: pngDataUrl }));
+      
+      console.log('✅ Conversion réussie');
+      return pngDataUrl;
+    } catch (error) {
+      console.error('❌ Erreur conversion TIF:', error);
+      return url; // Retourner l'URL originale en cas d'erreur
+    }
+  };
+
+  // Vérifier si une URL est un fichier TIF
+  const isTiffUrl = (url) => {
+    if (!url) return false;
+    const lowerUrl = url.toLowerCase();
+    return lowerUrl.includes('.tif') || lowerUrl.includes('.tiff');
+  };
+
+  // Composant pour afficher une image (avec conversion TIF si nécessaire)
+  const ImageDisplay = ({ src, alt, className }) => {
+    const [displaySrc, setDisplaySrc] = useState(src);
+    const [isConverting, setIsConverting] = useState(false);
+
+    useEffect(() => {
+      const loadImage = async () => {
+        if (isTiffUrl(src)) {
+          setIsConverting(true);
+          const converted = await convertTiffUrl(src);
+          setDisplaySrc(converted);
+          setIsConverting(false);
+        } else {
+          setDisplaySrc(src);
+        }
+      };
+      
+      loadImage();
+    }, [src]);
+
+    if (isConverting) {
+      return (
+        <div className={className + " flex items-center justify-center bg-slate-700"}>
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-400 mx-auto mb-2"></div>
+            <p className="text-xs text-slate-400">Conversion TIF...</p>
+          </div>
+        </div>
+      );
+    }
+
+    return <img src={displaySrc} alt={alt} className={className} />;
+  };
 
   const groupData = (data) => {
     if (!data || !Array.isArray(data)) return [];
@@ -95,28 +193,26 @@ const MesImages = () => {
       fetchData();
     }
   }, [currentUserId]);
+
   const getAvisStatus = (group) => {
-  const avis = group.avis;
-  if (avis.length < 2) return 'pending';
+    const avis = group.avis;
+    if (avis.length < 2) return 'pending';
 
-  // 1. On compte le nombre d'occurrences pour chaque combinaison Maladie + Stade
-  const counts = {};
-  
-  avis.forEach(item => {
-    // On crée une clé unique pour comparer (ex: "OMA-Suppurée")
-    const key = `${item.maladie_nom}-${item.stade_nom}`;
-    counts[key] = (counts[key] || 0) + 1;
-  });
+    const counts = {};
+    
+    avis.forEach(item => {
+      const key = `${item.maladie_nom}-${item.stade_nom}`;
+      counts[key] = (counts[key] || 0) + 1;
+    });
 
-  // 2. On cherche si une combinaison a été choisie par au moins 2 médecins
-  const hasConsensus = Object.values(counts).some(count => count >= 2);
+    const hasConsensus = Object.values(counts).some(count => count >= 2);
 
-  if (hasConsensus) {
-    return 'validated'; // Passe en violet/vert car au moins 2 sont d'accord
-  } else {
-    return 'divergent'; // Reste en rouge car tout le monde dit des choses différentes
-  }
-};
+    if (hasConsensus) {
+      return 'validated';
+    } else {
+      return 'divergent';
+    }
+  };
 
   const myGroups = allDataGrouped.filter(g => 
     g.avis.some(a => a.utilisateur_id === currentUserId)
@@ -185,7 +281,6 @@ const MesImages = () => {
         const renamedFileName = selectedGroup.avis[0]?.nom_image_renommee || "";
         const today = new Date().toISOString().split('T')[0];
 
-        // Préparation des données à insérer
         const rowsToInsert = [{
           image_hash: selectedGroup.image_hash,
           image_url: selectedGroup.image_url,
@@ -198,7 +293,6 @@ const MesImages = () => {
           date_diagnostique: today
         }];
 
-        // Ajout de l'avis du collaborateur si on est en mode collaboration
         if (sessionMode === 'collaboration' && collaborator) {
           rowsToInsert.push({
             image_hash: selectedGroup.image_hash,
@@ -310,7 +404,11 @@ const MesImages = () => {
             return (
               <div key={group.image_hash} className={`relative bg-slate-800 rounded-[2.5rem] overflow-hidden border transition-all ${status === 'validated' ? 'border-purple-500/50' : status === 'divergent' ? 'border-red-500/40' : 'border-white/5'}`}>
                 <div className="relative h-56">
-                  <img src={group.image_url} className="w-full h-full object-cover" alt="Tympan" />
+                  <ImageDisplay 
+                    src={group.image_url} 
+                    alt="Tympan" 
+                    className="w-full h-full object-cover"
+                  />
                   <div className="absolute top-4 right-4 flex gap-2">
                     {status === 'validated' && <span className="bg-purple-600 px-3 py-1 rounded-full text-[8px] font-bold uppercase">Validé</span>}
                     {status === 'divergent' && <span className="bg-red-600 px-3 py-1 rounded-full text-[8px] font-bold uppercase">Divergent</span>}
