@@ -491,7 +491,97 @@ const MesImages = () => {
           </div>
         </div>
       )}
+      {showModal && (
+        <div className="fixed inset-0 bg-black/90 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          {/* Passage en max-w-4xl pour avoir de la place pour l'image */}
+          <div className="bg-slate-800 rounded-[2.5rem] w-full max-w-4xl border border-white/10 shadow-2xl overflow-hidden flex flex-col md:flex-row">
+            
+            {/* SECTION GAUCHE : APERÇU DE L'IMAGE */}
+            <div className="flex-1 bg-black/20 p-4 border-r border-white/5 flex flex-col items-center justify-center min-h-[300px]">
+              <p className="text-[10px] font-black text-slate-500 uppercase mb-4 tracking-widest">Image à diagnostiquer</p>
+              <div className="relative w-full h-full flex items-center justify-center overflow-hidden rounded-2xl">
+                <ImageDisplay 
+                  src={modalMode === 'edit' ? selectedImage?.image_url : selectedGroup?.image_url} 
+                  alt="Aperçu diagnostic" 
+                  className="max-h-full max-w-full object-contain shadow-2xl"
+                />
+              </div>
+              {modalMode === 'add' && (
+                <p className="mt-4 text-[9px] text-cyan-400 font-bold uppercase">
+                  Référence : {selectedGroup?.avis[0]?.nom_image_originale}
+                </p>
+              )}
+            </div>
 
+            {/* SECTION DROITE : FORMULAIRE */}
+            <div className="w-full md:w-[380px] p-8 flex flex-col justify-center">
+              <h2 className="text-xl font-black mb-8 text-center uppercase tracking-tighter">
+                {step === 1 ? (modalMode === 'edit' ? "Modifier" : "Contribuer") : "Validation"}
+              </h2>
+
+              {step === 1 ? (
+                <div className="space-y-6">
+                  {modalMode === 'edit' && (
+                    <div className="flex items-start gap-3 p-4 bg-blue-500/10 border border-blue-500/30 rounded-2xl">
+                      <Info size={20} className="text-blue-400 flex-shrink-0 mt-0.5" />
+                      <p className="text-xs text-blue-300">Seul votre diagnostic sera modifié.</p>
+                    </div>
+                  )}
+                  
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black text-slate-500 uppercase ml-2">Pathologie</label>
+                    <select 
+                      value={newDiseaseName} 
+                      onChange={(e) => { setNewDiseaseName(e.target.value); setNewDiseaseType('Standard'); }} 
+                      className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-sm"
+                    >
+                      {categoryOptions.map(opt => <option key={opt.name} value={opt.name}>{opt.fullName}</option>)}
+                    </select>
+                  </div>
+
+                  {currentCategory?.options.length > 0 && (
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-slate-500 uppercase ml-2">Stade / Type</label>
+                      <select 
+                        value={newDiseaseType} 
+                        onChange={(e) => setNewDiseaseType(e.target.value)} 
+                        className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-sm"
+                      >
+                        <option value="Standard">Standard</option>
+                        {currentCategory.options.map(o => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                    </div>
+                  )}
+
+                  <button onClick={() => setStep(2)} className="w-full py-5 bg-cyan-600 rounded-2xl font-black uppercase text-xs tracking-widest hover:bg-cyan-500 shadow-lg shadow-cyan-900/20">
+                    Continuer
+                  </button>
+                  <button onClick={() => setShowModal(false)} className="w-full text-slate-500 text-[10px] font-bold uppercase mt-2">
+                    Annuler
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-6">
+                  <p className="text-[10px] text-slate-400 text-center uppercase font-bold px-4">Confirmez avec votre mot de passe</p>
+                  <input 
+                    type="password" 
+                    value={password} 
+                    onChange={(e) => setPassword(e.target.value)} 
+                    placeholder="••••••••" 
+                    className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-center" 
+                    autoFocus 
+                  />
+                  {error && <p className="text-red-400 text-center text-[10px] font-bold uppercase">{error}</p>}
+                  <div className="flex gap-4">
+                    <button onClick={() => setStep(1)} className="flex-1 py-5 bg-slate-700 rounded-2xl font-black uppercase text-xs">Retour</button>
+                    <button onClick={handleConfirmAction} className="flex-1 py-5 bg-cyan-600 rounded-2xl font-black uppercase text-xs">Valider</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
       {showDeleteModal && (
         <div className="fixed inset-0 bg-black/90 flex items-center justify-center z-50 p-4 backdrop-blur-sm">
           <div className="bg-slate-800 p-8 rounded-[2.5rem] w-full max-w-md border border-red-500/20">
