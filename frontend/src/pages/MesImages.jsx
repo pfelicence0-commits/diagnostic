@@ -141,11 +141,28 @@ const MesImages = () => {
 
   useEffect(() => { if (currentUserId) fetchData(); }, [currentUserId]);
 
+  const normalizeAvis = (maladie_nom, stade_nom) => {
+    // Séparer les maladies et les stades
+    const maladies = (maladie_nom || '').split('+').map(m => m.trim());
+    const stades   = (stade_nom   || '').split('/').map(s => s.trim());
+
+    // Associer chaque maladie à son stade correspondant
+    const pairs = maladies.map((m, i) => ({
+      maladie: m.toLowerCase(),
+      stade:   (stades[i] || 'standard').toLowerCase().replace('aucun', 'standard'),
+    }));
+
+    // Trier par nom de maladie pour ignorer l'ordre d'ajout
+    pairs.sort((a, b) => a.maladie.localeCompare(b.maladie));
+
+    return pairs.map(p => `${p.maladie}|${p.stade}`).join('::');
+  };
+
   const getAvisStatus = (group) => {
     if (group.avis.length < 2) return 'pending';
     const counts = {};
     group.avis.forEach(item => {
-      const key = `${item.maladie_nom}-${item.stade_nom}`;
+      const key = normalizeAvis(item.maladie_nom, item.stade_nom);
       counts[key] = (counts[key] || 0) + 1;
     });
     return Object.values(counts).some(c => c >= 2) ? 'validated' : 'divergent';
