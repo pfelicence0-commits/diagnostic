@@ -28,6 +28,7 @@ const MesImages = () => {
   const [newDiseaseType, setNewDiseaseType] = useState('Standard');
   // Sélections multiples pour le mode ajout d'avis
   const [multiSelections, setMultiSelections] = useState({});
+  const [showAvisInfo, setShowAvisInfo] = useState(false);
   const [password, setPassword]           = useState('');
   const [error, setError]                 = useState('');
   const [step, setStep]                   = useState(1);
@@ -211,7 +212,8 @@ const MesImages = () => {
       const today       = new Date().toISOString().split('T')[0];
       const maladieNom  = keys.join(' + ');
       const stadeNom    = keys.map(k => multiSelections[k].stage || 'Standard').join(' / ');
-      const baseRow = {
+      
+      const baseData = {
         image_hash:          selectedGroup.image_hash,
         image_url:           selectedGroup.image_url,
         maladie_nom:         maladieNom,
@@ -220,12 +222,46 @@ const MesImages = () => {
         nom_image_renommee:  selectedGroup.avis[0]?.nom_image_renommee  || '',
         date_diagnostique:   today,
       };
-      const rows = [{ ...baseRow, utilisateur_id: currentUserId, nom_medecin_diagnostiqueur: doctorDisplayName }];
+      
+      // Liste des médecins à insérer
+      const medecins = [
+        { id: currentUserId, nom: doctorDisplayName }
+      ];
       if (sessionMode === 'collaboration' && collaborator) {
-        rows.push({ ...baseRow, utilisateur_id: collaborator.id, nom_medecin_diagnostiqueur: `${collaborator.prenom} ${collaborator.nom}`.trim() });
+        medecins.push({ 
+          id: collaborator.id, 
+          nom: `${collaborator.prenom} ${collaborator.nom}`.trim() 
+        });
       }
-      const { error } = await supabase.from('categories_diagnostics').insert(rows);
-      if (error) throw error;
+
+      // Insérer pour chaque médecin (RPC en mode collaboration)
+      for (const medecin of medecins) {
+        if (sessionMode === 'collaboration') {
+          // Utiliser RPC pour contourner RLS
+          const { error } = await supabase.rpc('insert_diagnostic_collaboration', {
+            p_image_hash:         baseData.image_hash,
+            p_image_url:          baseData.image_url,
+            p_utilisateur_id:     medecin.id,
+            p_nom_medecin:        medecin.nom,
+            p_maladie_nom:        baseData.maladie_nom,
+            p_stade_nom:          baseData.stade_nom,
+            p_nom_image_originale: baseData.nom_image_originale,
+            p_nom_image_renommee:  baseData.nom_image_renommee,
+            p_path_image_final:    baseData.nom_image_renommee,
+            p_date_diagnostique:   baseData.date_diagnostique
+          });
+          if (error) throw error;
+        } else {
+          // Mode solo : insertion normale
+          const { error } = await supabase.from('categories_diagnostics').insert([{
+            ...baseData,
+            utilisateur_id: medecin.id,
+            nom_medecin_diagnostiqueur: medecin.nom
+          }]);
+          if (error) throw error;
+        }
+      }
+      
       setShowModal(false);
       setMultiSelections({});
       fetchData();
@@ -338,7 +374,8 @@ const MesImages = () => {
                   </div>
                 </div>
                 <div className="p-6 space-y-3">
-                  {group.avis.map(avi => (
+                  {/* Afficher les avis SEULEMENT dans "Mes diagnostics" */}
+                  {activeTab === 'mes-diagnostics' && group.avis.map(avi => (
                     <div key={avi.id} className={`p-4 rounded-2xl border ${avi.utilisateur_id === currentUserId ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-slate-900 border-transparent'}`}>
                       <div className="flex justify-between items-start">
                         <div>
@@ -354,13 +391,25 @@ const MesImages = () => {
                       </div>
                     </div>
                   ))}
+                  
+                  {/* Message informatif dans "Contribuer" */}
                   {activeTab === 'disponibles' && (
-                    <button
-                      onClick={() => { setSelectedGroup(group); setModalMode('add'); setMultiSelections({}); setStep(1); setShowModal(true); }}
-                      className="w-full py-4 mt-2 bg-cyan-600 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-cyan-500 transition-all"
-                    >
-                      Donner mon avis
-                    </button>
+                    <>
+                      <div className="p-4 rounded-2xl bg-slate-900 border border-slate-700">
+                        <p className="text-[10px] text-slate-400 text-center uppercase font-bold mb-2">
+                          👁️ {group.avis.length} avis déjà donné{group.avis.length > 1 ? 's' : ''}
+                        </p>
+                        <p className="text-[9px] text-slate-500 text-center italic">
+                          Donnez votre diagnostic en toute indépendance
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => { setSelectedGroup(group); setModalMode('add'); setMultiSelections({}); setShowAvisInfo(false); setStep(1); setShowModal(true); }}
+                        className="w-full py-4 bg-cyan-600 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-cyan-500 transition-all"
+                      >
+                        Donner mon avis
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
@@ -378,34 +427,58 @@ const MesImages = () => {
 
             {/* ── IMAGE (gauche) — uniquement mode ajout étape 1 ── */}
             {modalMode === 'add' && step === 1 && selectedGroup && (
-              <div className="w-1/2 shrink-0 relative bg-slate-900 min-h-[440px]">
+              <div className="w-1/2 shrink-0 relative bg-slate-900 min-h-[440px] flex items-center justify-center p-4">
                 <ImageDisplay
                   src={selectedGroup.image_url}
                   alt="Image à diagnostiquer"
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain"
                 />
-                {/* Overlay bas : nom + avis existants */}
+                {/* Overlay bas : nom du fichier uniquement */}
                 <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent p-5">
                   <p className="text-[9px] text-cyan-400 uppercase font-bold tracking-widest mb-1">Image à diagnostiquer</p>
-                  <p className="text-xs text-white font-bold truncate mb-3">
+                  <p className="text-xs text-white font-bold truncate">
                     {selectedGroup.avis[0]?.nom_image_originale || 'Image'}
                   </p>
-                  {selectedGroup.avis.length > 0 && (
-                    <>
-                      <p className="text-[9px] text-slate-400 uppercase font-bold mb-1">Avis déjà donnés :</p>
-                      <div className="space-y-1">
-                        {selectedGroup.avis.map(a => (
-                          <div key={a.id} className="flex items-center gap-2">
-                            <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0" />
-                            <p className="text-[9px] text-slate-300">
-                              Dr. {a.nom_medecin_diagnostiqueur} — <span className="text-cyan-400 font-bold">{a.maladie_nom}{a.stade_nom && a.stade_nom !== 'Standard' ? ` (${a.stade_nom})` : ''}</span>
-                            </p>
-                          </div>
-                        ))}
-                      </div>
-                    </>
-                  )}
                 </div>
+
+                {/* Badge info cliquable en haut à droite */}
+                {selectedGroup.avis.length > 0 && (
+                  <div className="absolute top-4 right-4">
+                    <button
+                      onMouseEnter={() => setShowAvisInfo(true)}
+                      onMouseLeave={() => setShowAvisInfo(false)}
+                      className="bg-cyan-500/80 hover:bg-cyan-500 backdrop-blur-sm px-3 py-2 rounded-full flex items-center gap-2 transition-all"
+                    >
+                      <svg className="w-4 h-4 text-white" fill="currentColor" viewBox="0 0 20 20">
+                        <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd"/>
+                      </svg>
+                      <span className="text-[10px] font-bold text-white">{selectedGroup.avis.length} avis</span>
+                    </button>
+
+                    {/* Bulle d'information au survol */}
+                    {showAvisInfo && (
+                      <div className="absolute top-full right-0 mt-2 w-72 bg-slate-800/95 backdrop-blur-md border border-cyan-500/30 rounded-2xl p-4 shadow-2xl z-50">
+                        <p className="text-[9px] text-cyan-400 uppercase font-bold mb-2 tracking-wider">👁️ Avis existants (optionnel)</p>
+                        <div className="space-y-2">
+                          {selectedGroup.avis.map(a => (
+                            <div key={a.id} className="flex items-start gap-2 p-2 bg-slate-900/50 rounded-lg">
+                              <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0 mt-1.5" />
+                              <div className="flex-1 min-w-0">
+                                <p className="text-[9px] text-slate-400">Dr. {a.nom_medecin_diagnostiqueur}</p>
+                                <p className="text-[10px] text-cyan-300 font-bold truncate">
+                                  {a.maladie_nom}{a.stade_nom && a.stade_nom !== 'Standard' ? ` (${a.stade_nom})` : ''}
+                                </p>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                        <p className="text-[8px] text-slate-500 mt-3 italic text-center">
+                          Consultez si besoin, mais formez votre propre avis
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
 
