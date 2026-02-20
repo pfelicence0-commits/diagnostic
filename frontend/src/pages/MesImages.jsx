@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Edit, Image as ImageIcon, Trash2, AlertTriangle, Info } from 'lucide-react';
 import GlobalMenu from '../components/GlobalMenu';
+import AnnotationCanvas from '../components/AnnotationCanvas';
 import { supabase } from '../supabaseClient';
 import UTIF from 'utif';
 
@@ -36,6 +37,10 @@ const MesImages = () => {
   const [deleteError, setDeleteError]     = useState('');
   const [searchTerm, setSearchTerm]       = useState('');
   const [searchDoctor, setSearchDoctor]   = useState('');
+  const [showAnnotationModal, setShowAnnotationModal] = useState(false);
+  const [annotationPayload, setAnnotationPayload] = useState(null);
+  const [annotationPreviewUrl, setAnnotationPreviewUrl] = useState('');
+  const [annotationSourceUrl, setAnnotationSourceUrl] = useState('');
 
   const [currentUser, setCurrentUser]     = useState(null);
   const [sessionMode, setSessionMode]     = useState('solo');
@@ -203,15 +208,134 @@ const MesImages = () => {
     setShowDeleteModal(true);
   };
 
+  const dataUrlToBlob = async (dataUrl) => {
+    const response = await fetch(dataUrl);
+    return response.blob();
+  };
+
+  const buildAnnotatedImageDataUrl = (src, payload) => {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = img.naturalWidth;
+          canvas.height = img.naturalHeight;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0);
+
+          const points = payload.points_pixels || [];
+          if (points.length >= 3) {
+            ctx.beginPath();
+            ctx.moveTo(points[0].x, points[0].y);
+            for (let index = 1; index < points.length; index += 1) {
+              ctx.lineTo(points[index].x, points[index].y);
+            }
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(34, 211, 238, 0.25)';
+            ctx.fill();
+            ctx.strokeStyle = '#22d3ee';
+            ctx.lineWidth = Math.max(2, Math.round(Math.min(img.naturalWidth, img.naturalHeight) * 0.003));
+            ctx.stroke();
+          }
+
+          resolve(canvas.toDataURL('image/png', 1.0));
+        } catch (e) {
+          reject(e);
+        }
+      };
+      img.onerror = () => reject(new Error('Impossible de générer l\'image annotée.'));
+      img.src = src;
+    });
+  };
+
+  const openAnnotationModal = async () => {
+    if (!selectedGroup?.image_url) {
+      setError('Image introuvable pour l\'annotation.');
+      return;
+    }
+    setError('');
+    const src = isTiffUrl(selectedGroup.image_url)
+      ? await convertTiffUrl(selectedGroup.image_url)
+      : selectedGroup.image_url;
+    setAnnotationSourceUrl(src);
+    setShowAnnotationModal(true);
+  };
+
+  const handleAnnotationSave = async (payload) => {
+    try {
+      const source = annotationSourceUrl || selectedGroup?.image_url;
+      const preview = await buildAnnotatedImageDataUrl(source, payload);
+      setAnnotationPayload(payload);
+      setAnnotationPreviewUrl(preview);
+      setShowAnnotationModal(false);
+    } catch (e) {
+      console.error(e);
+      setError('Erreur lors de la génération de l\'image annotée.');
+    }
+  };
+
+  const getLatestDiagnosticIdForUser = async (imageHash, userId) => {
+    const { data, error } = await supabase
+      .from('categories_diagnostics')
+      .select('id')
+      .eq('image_hash', imageHash)
+      .eq('utilisateur_id', userId)
+      .order('id', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error) throw error;
+    return data?.id;
+  };
+
+  const saveAnnotationRecord = async ({ diagnosticId, imageHash }) => {
+    if (!annotationPayload || !annotationPreviewUrl || !diagnosticId) return;
+
+    const fileName = `annotation_${Date.now()}_${currentUserId}.png`;
+    const storagePath = `annotations/${imageHash}/${fileName}`;
+    const blob = await dataUrlToBlob(annotationPreviewUrl);
+
+    const { error: uploadError } = await supabase.storage
+      .from('images')
+      .upload(storagePath, blob, {
+        contentType: 'image/png',
+        upsert: true,
+      });
+    if (uploadError) throw uploadError;
+
+    const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(storagePath);
+
+    const { error: annotationInsertError } = await supabase
+      .from('annotations_maladie')
+      .insert([{
+        diagnostic_id: diagnosticId,
+        image_hash: imageHash,
+        utilisateur_id: currentUserId,
+        image_original_url: selectedGroup?.image_url || '',
+        annotated_image_path: storagePath,
+        annotated_image_url: publicUrl,
+        annotation_details: annotationPayload,
+      }]);
+
+    if (annotationInsertError) throw annotationInsertError;
+  };
+
   // Soumission directe SANS mot de passe (mode ajout d'avis) — multi-maladies
   const handleAddAvis = async () => {
     setError('');
     const keys = Object.keys(multiSelections);
     if (keys.length === 0) { setError('Sélectionnez au moins une pathologie.'); return; }
+    if (!annotationPayload) {
+      setError('Veuillez tracer le contour de la maladie avant validation.');
+      return;
+    }
     try {
       const today       = new Date().toISOString().split('T')[0];
       const maladieNom  = keys.join(' + ');
       const stadeNom    = keys.map(k => multiSelections[k].stage || 'Standard').join(' / ');
+      const insertedDiagnosticIds = [];
       
       const baseData = {
         image_hash:          selectedGroup.image_hash,
@@ -251,19 +375,34 @@ const MesImages = () => {
             p_date_diagnostique:   baseData.date_diagnostique
           });
           if (error) throw error;
+
+          if (medecin.id === currentUserId) {
+            const latestId = await getLatestDiagnosticIdForUser(baseData.image_hash, currentUserId);
+            if (latestId) insertedDiagnosticIds.push(latestId);
+          }
         } else {
           // Mode solo : insertion normale
-          const { error } = await supabase.from('categories_diagnostics').insert([{
+          const { data, error } = await supabase.from('categories_diagnostics').insert([{
             ...baseData,
             utilisateur_id: medecin.id,
             nom_medecin_diagnostiqueur: medecin.nom
-          }]);
+          }]).select('id').single();
           if (error) throw error;
+          if (medecin.id === currentUserId && data?.id) insertedDiagnosticIds.push(data.id);
         }
       }
+
+      const targetDiagnosticId = insertedDiagnosticIds[0] || await getLatestDiagnosticIdForUser(baseData.image_hash, currentUserId);
+      await saveAnnotationRecord({
+        diagnosticId: targetDiagnosticId,
+        imageHash: baseData.image_hash,
+      });
       
       setShowModal(false);
       setMultiSelections({});
+      setAnnotationPayload(null);
+      setAnnotationPreviewUrl('');
+      setAnnotationSourceUrl('');
       fetchData();
     } catch (err) {
       console.error(err);
@@ -404,7 +543,17 @@ const MesImages = () => {
                         </p>
                       </div>
                       <button
-                        onClick={() => { setSelectedGroup(group); setModalMode('add'); setMultiSelections({}); setShowAvisInfo(false); setStep(1); setShowModal(true); }}
+                        onClick={() => {
+                          setSelectedGroup(group);
+                          setModalMode('add');
+                          setMultiSelections({});
+                          setShowAvisInfo(false);
+                          setStep(1);
+                          setAnnotationPayload(null);
+                          setAnnotationPreviewUrl('');
+                          setAnnotationSourceUrl('');
+                          setShowModal(true);
+                        }}
                         className="w-full py-4 bg-cyan-600 rounded-2xl font-black text-[10px] uppercase tracking-widest hover:bg-cyan-500 transition-all"
                       >
                         Donner mon avis
@@ -503,46 +652,67 @@ const MesImages = () => {
 
                   {/* ── Mode AJOUT : checkboxes multi-sélection ── */}
                   {modalMode === 'add' ? (
-                    <div className="space-y-2 overflow-y-auto max-h-[340px] pr-1 custom-scrollbar">
-                      {categoryOptions.map(cat => {
-                        const isChecked = !!multiSelections[cat.name];
-                        const icons = { OMA:'🔴', OSM:'🟡', Perfo:'🔵', Chole:'🟣', 'PDR + Atel':'🟠', Normal:'🟢', Autre:'⚪' };
-                        return (
-                          <div key={cat.name} className={`rounded-2xl border transition-all ${isChecked ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
-                            <div className="flex items-center gap-3 p-3">
-                              <span className="text-lg">{icons[cat.name]}</span>
-                              <div className="flex-1">
-                                <p className="text-xs font-bold">{cat.name}</p>
-                                <p className="text-[9px] text-slate-400 uppercase">{cat.fullName}</p>
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between gap-3 p-3 rounded-2xl border border-cyan-500/30 bg-cyan-500/10">
+                        <div>
+                          <p className="text-[10px] font-bold uppercase text-cyan-400">Contour maladie</p>
+                          <p className="text-[10px] text-slate-300">Tracer la zone malade avant validation.</p>
+                        </div>
+                        <button
+                          onClick={openAnnotationModal}
+                          className="px-4 py-2 text-[10px] font-black uppercase bg-cyan-600 rounded-xl hover:bg-cyan-500"
+                        >
+                          {annotationPayload ? 'Modifier contour' : 'Tracer contour'}
+                        </button>
+                      </div>
+
+                      {annotationPreviewUrl && (
+                        <div className="rounded-2xl border border-white/10 overflow-hidden">
+                          <img src={annotationPreviewUrl} alt="Aperçu annotation" className="w-full h-32 object-cover" />
+                        </div>
+                      )}
+
+                      <div className="space-y-2 overflow-y-auto max-h-[260px] pr-1 custom-scrollbar">
+                        {categoryOptions.map(cat => {
+                          const isChecked = !!multiSelections[cat.name];
+                          const icons = { OMA:'🔴', OSM:'🟡', Perfo:'🔵', Chole:'🟣', 'PDR + Atel':'🟠', Normal:'🟢', Autre:'⚪' };
+                          return (
+                            <div key={cat.name} className={`rounded-2xl border transition-all ${isChecked ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
+                              <div className="flex items-center gap-3 p-3">
+                                <span className="text-lg">{icons[cat.name]}</span>
+                                <div className="flex-1">
+                                  <p className="text-xs font-bold">{cat.name}</p>
+                                  <p className="text-[9px] text-slate-400 uppercase">{cat.fullName}</p>
+                                </div>
+                                <input
+                                  type="checkbox"
+                                  className="w-5 h-5 accent-cyan-400"
+                                  checked={isChecked}
+                                  onChange={e => {
+                                    const s = { ...multiSelections };
+                                    if (e.target.checked) s[cat.name] = { stage: 'Standard' };
+                                    else delete s[cat.name];
+                                    setMultiSelections(s);
+                                  }}
+                                />
                               </div>
-                              <input
-                                type="checkbox"
-                                className="w-5 h-5 accent-cyan-400"
-                                checked={isChecked}
-                                onChange={e => {
-                                  const s = { ...multiSelections };
-                                  if (e.target.checked) s[cat.name] = { stage: 'Standard' };
-                                  else delete s[cat.name];
-                                  setMultiSelections(s);
-                                }}
-                              />
+                              {/* Stade déroulant si coché et options disponibles */}
+                              {isChecked && cat.options.length > 0 && (
+                                <div className="px-3 pb-3">
+                                  <select
+                                    className="w-full bg-slate-900 text-[10px] p-2.5 rounded-xl border border-cyan-500/30 text-white outline-none"
+                                    value={multiSelections[cat.name].stage}
+                                    onChange={e => setMultiSelections({ ...multiSelections, [cat.name]: { stage: e.target.value } })}
+                                  >
+                                    <option value="Standard">Stade...</option>
+                                    {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
+                                  </select>
+                                </div>
+                              )}
                             </div>
-                            {/* Stade déroulant si coché et options disponibles */}
-                            {isChecked && cat.options.length > 0 && (
-                              <div className="px-3 pb-3">
-                                <select
-                                  className="w-full bg-slate-900 text-[10px] p-2.5 rounded-xl border border-cyan-500/30 text-white outline-none"
-                                  value={multiSelections[cat.name].stage}
-                                  onChange={e => setMultiSelections({ ...multiSelections, [cat.name]: { stage: e.target.value } })}
-                                >
-                                  <option value="Standard">Stade...</option>
-                                  {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
-                                </select>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
+                          );
+                        })}
+                      </div>
                     </div>
                   ) : (
                     /* ── Mode EDIT : menus déroulants simples ── */
@@ -602,6 +772,15 @@ const MesImages = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {showAnnotationModal && annotationSourceUrl && (
+        <AnnotationCanvas
+          imageSrc={annotationSourceUrl}
+          initialPoints={annotationPayload?.points_normalized || []}
+          onClose={() => setShowAnnotationModal(false)}
+          onSave={handleAnnotationSave}
+        />
       )}
 
       {/* ─── MODALE SUPPRESSION ─── */}
