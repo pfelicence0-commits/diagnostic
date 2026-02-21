@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Upload, Activity, Image as ImageIcon, CheckCircle2, AlertCircle, Edit2 } from 'lucide-react';
+import { Upload, Activity, Image as ImageIcon, CheckCircle2, AlertCircle, Edit2, X } from 'lucide-react';
 import GlobalMenu from '../components/GlobalMenu';
 import AnnotationCanvas from '../components/AnnotationCanvas';
 import { supabase } from '../supabaseClient'; 
@@ -49,6 +49,17 @@ export default function Accueil() {
     setAnnotations({});
     setAnnotationPreviewUrl('');
     setCurrentAnnotatingDisease(null);
+  };
+
+  // ── Vider toute la galerie ──────────────────────────────
+  const handleClearQueue = () => {
+    setFileQueue([]);
+    setCurrentIndex(null);
+    setSelectedImage(null);
+    setSelectedFile(null);
+    setSelections({});
+    setSaveMessage('');
+    resetAnnotationState();
   };
 
   const processFileToPreview = async (file) => {
@@ -204,6 +215,35 @@ export default function Accueil() {
     return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
   };
 
+  // ── Vérifier si l'image existe déjà (par hash + utilisateur) ──
+  const checkImageAlreadyExists = async (imageHash, userId) => {
+    const { count } = await supabase
+      .from('categories_diagnostics')
+      .select('*', { count: 'exact', head: true })
+      .eq('image_hash', imageHash)
+      .eq('utilisateur_id', userId);
+    return (count || 0) > 0;
+  };
+
+  // ── Passer à l'image suivante ou vider si c'était la dernière ──
+  const goToNext = (currentQueue, currentIdx) => {
+    const next = currentIdx + 1;
+    if (next < currentQueue.length) {
+      setCurrentIndex(next);
+      setSelectedFile(currentQueue[next].file);
+      setSelectedImage(currentQueue[next].preview);
+      setSelections({});
+      resetAnnotationState();
+      setSaveMessage('');
+    } else {
+      // Toutes les images ont été traitées → vider la galerie
+      setTimeout(() => {
+        handleClearQueue();
+        setSaveMessage('');
+      }, 1500);
+    }
+  };
+
   const buildRenamedFileName = async (selectedDiseases, selectionsData, docId, fileExt) => {
     const diseaseParts = selectedDiseases.map(diseaseName => {
       const stage = selectionsData[diseaseName]?.stage || 'Aucun';
@@ -240,8 +280,22 @@ export default function Accueil() {
     setIsSaving(true);
     try {
       const imageHash = await calculateHash(selectedFile);
-      const fileExt   = selectedFile.name.split('.').pop();
-      const doctors   = sessionMode === 'collaboration' && collaborator
+
+      // ── Vérifier si l'image existe déjà pour ce médecin ──────
+      const alreadyExists = await checkImageAlreadyExists(imageHash, currentUser.id);
+      if (alreadyExists) {
+        // Marquer comme doublon et passer à la suivante automatiquement
+        setSaveMessage(`⚠️ Image déjà enregistrée — passage à la suivante...`);
+        setFileQueue(prev =>
+          prev.map((item, i) => i === currentIndex ? { ...item, status: 'duplicate' } : item)
+        );
+        setTimeout(() => goToNext(fileQueue, currentIndex), 2000);
+        setIsSaving(false);
+        return;
+      }
+
+      const fileExt = selectedFile.name.split('.').pop();
+      const doctors = sessionMode === 'collaboration' && collaborator
         ? [currentUser, collaborator]
         : [currentUser];
 
@@ -258,13 +312,11 @@ export default function Accueil() {
         const storagePath = `diagnostics/${nomRenomme}`;
 
         const { error: uploadErr } = await supabase.storage
-          .from('images')
-          .upload(storagePath, selectedFile);
+          .from('images').upload(storagePath, selectedFile);
         if (uploadErr) throw uploadErr;
 
         const { data: { publicUrl } } = supabase.storage
-          .from('images')
-          .getPublicUrl(storagePath);
+          .from('images').getPublicUrl(storagePath);
 
         const { data: diagData, error: diagErr } = await supabase
           .from('categories_diagnostics')
@@ -287,13 +339,11 @@ export default function Accueil() {
         if (doc.id === currentUser.id && combinedAnnotBlob) {
           const annotPath = `annotations/${imageHash}_${doc.id}_combined.png`;
           const { error: uploadAnnotErr } = await supabase.storage
-            .from('images')
-            .upload(annotPath, combinedAnnotBlob);
+            .from('images').upload(annotPath, combinedAnnotBlob);
 
           if (!uploadAnnotErr) {
             const { data: { publicUrl: annotPublicUrl } } = supabase.storage
-              .from('images')
-              .getPublicUrl(annotPath);
+              .from('images').getPublicUrl(annotPath);
 
             for (const diseaseName of selectedDiseases) {
               const { error: annotErr } = await supabase
@@ -313,22 +363,26 @@ export default function Accueil() {
         }
       }
 
+      // Marquer comme uploadé
+      const updatedQueue = fileQueue.map((item, i) =>
+        i === currentIndex ? { ...item, status: 'uploaded' } : item
+      );
+      setFileQueue(updatedQueue);
       setSaveMessage(`✅ ${selectedDiseases.length} maladie(s) enregistrée(s) !`);
-      setFileQueue(prev =>
-        prev.map((item, i) => i === currentIndex ? { ...item, status: 'uploaded' } : item)
+
+      // Vérifier si toutes les images sont traitées
+      const allDone = updatedQueue.every(item =>
+        item.status === 'uploaded' || item.status === 'duplicate'
       );
 
-      setTimeout(() => {
-        if (currentIndex < fileQueue.length - 1) {
-          const next = currentIndex + 1;
-          setCurrentIndex(next);
-          setSelectedFile(fileQueue[next].file);
-          setSelectedImage(fileQueue[next].preview);
-          setSelections({});
-          resetAnnotationState();
-          setSaveMessage('');
-        }
-      }, 1500);
+      if (allDone) {
+        // Dernière image — vider la galerie après délai
+        setSaveMessage(`✅ Toutes les images ont été enregistrées !`);
+        setTimeout(() => handleClearQueue(), 2500);
+      } else {
+        // Passer à la suivante
+        setTimeout(() => goToNext(updatedQueue, currentIndex), 1500);
+      }
 
     } catch (err) {
       setSaveMessage(`❌ Erreur: ${err.message}`);
@@ -340,33 +394,43 @@ export default function Accueil() {
   const selectedDiseases = Object.keys(selections);
 
   return (
-    // ── Toute la page est verrouillée à la hauteur de l'écran, RIEN ne déborde ──
     <div className="h-screen flex flex-col bg-[#0f172a] text-white font-sans overflow-hidden">
       <GlobalMenu />
 
-      {/* ── Corps principal — exactement l'espace restant sous la navbar ── */}
       <div className="flex flex-1 gap-6 p-6 pt-[80px] overflow-hidden min-h-0">
 
-        {/* ════════════════════════════════════════════
-            FILE D'ATTENTE
-            - largeur fixe
-            - hauteur = 100% du parent (flex)
-            - scroll INTERNE uniquement
-        ════════════════════════════════════════════ */}
+        {/* ── GALERIE ── */}
         <div className="w-48 flex-shrink-0 flex flex-col bg-slate-800/50 rounded-3xl border border-white/10 overflow-hidden">
-          {/* En-tête fixe */}
+          
+          {/* En-tête avec bouton X */}
           <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10 flex-shrink-0">
             <ImageIcon size={15} className="text-cyan-400 flex-shrink-0" />
-            <h2 className="text-[10px] font-bold uppercase tracking-widest truncate">
+            <h2 className="text-[10px] font-bold uppercase tracking-widest truncate flex-1">
               Galerie ({fileQueue.length})
             </h2>
+            {/* Bouton vider la galerie */}
+            {fileQueue.length > 0 && (
+              <button
+                onClick={handleClearQueue}
+                disabled={isSaving}
+                title="Vider la galerie"
+                className="w-5 h-5 flex-shrink-0 flex items-center justify-center rounded-full bg-slate-600 hover:bg-red-500 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <X size={11} className="text-white" />
+              </button>
+            )}
           </div>
 
-          {/* Liste scrollable — ne sort JAMAIS du cadre */}
+          {/* Liste images */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar min-h-0">
             {isLoading ? (
               <div className="flex items-center justify-center py-10">
                 <Activity className="animate-spin text-cyan-400" size={24} />
+              </div>
+            ) : fileQueue.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-10 gap-2 text-slate-600">
+                <ImageIcon size={28} />
+                <p className="text-[9px] uppercase font-bold text-center">Aucune image</p>
               </div>
             ) : (
               fileQueue.map((item, idx) => (
@@ -388,9 +452,19 @@ export default function Accueil() {
                   }`}
                 >
                   <img src={item.preview} alt="mini" className="w-full h-20 object-cover" />
+
+                  {/* Badge uploadé */}
                   {item.status === 'uploaded' && (
-                    <div className="absolute inset-0 bg-green-500/60 flex items-center justify-center">
-                      <CheckCircle2 size={24} className="text-white" />
+                    <div className="absolute inset-0 bg-green-500/70 flex items-center justify-center">
+                      <CheckCircle2 size={22} className="text-white" />
+                    </div>
+                  )}
+
+                  {/* Badge doublon */}
+                  {item.status === 'duplicate' && (
+                    <div className="absolute inset-0 bg-orange-500/70 flex flex-col items-center justify-center gap-1">
+                      <AlertCircle size={18} className="text-white" />
+                      <span className="text-[8px] text-white font-bold uppercase">Doublon</span>
                     </div>
                   )}
                 </div>
@@ -399,12 +473,10 @@ export default function Accueil() {
           </div>
         </div>
 
-        {/* ════════════════════════════════════════════
-            PANNEAU CENTRAL
-        ════════════════════════════════════════════ */}
+        {/* ── PANNEAU CENTRAL ── */}
         <div className="flex-1 flex gap-6 min-h-0 overflow-hidden">
 
-          {/* ── DIAGNOSTIC (scroll interne) ── */}
+          {/* ── DIAGNOSTIC ── */}
           <div className="w-[360px] flex-shrink-0 flex flex-col bg-slate-800/30 rounded-3xl border border-white/10 overflow-hidden">
             <div className="px-6 pt-6 pb-2 flex-shrink-0">
               <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
@@ -502,16 +574,10 @@ export default function Accueil() {
             </div>
           </div>
 
-          {/* ════════════════════════════════════════════
-              ZONE IMAGE + BOUTON
-              - flex-1 = prend tout l'espace restant
-              - flex-col pour empiler image et bouton
-              - image = flex-1 (prend tout sauf le bouton)
-              - bouton = flex-shrink-0 (hauteur fixe, toujours visible)
-          ════════════════════════════════════════════ */}
+          {/* ── ZONE IMAGE + BOUTON ── */}
           <div className="flex-1 flex flex-col gap-3 min-h-0 overflow-hidden">
 
-            {/* Zone image — occupe tout l'espace vertical disponible */}
+            {/* Zone image */}
             <div className="flex-1 min-h-0 bg-slate-950 border-2 border-dashed border-white/10 rounded-[2rem] flex items-center justify-center relative overflow-hidden">
               {!selectedImage ? (
                 <label className="cursor-pointer text-center p-8 hover:scale-105 transition-transform">
@@ -531,6 +597,16 @@ export default function Accueil() {
                     className="w-full h-full object-contain"
                     alt="Current"
                   />
+
+                  {/* Indicateur progression */}
+                  {fileQueue.length > 0 && currentIndex !== null && (
+                    <div className="absolute bottom-4 right-4 bg-black/70 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-white/10">
+                      <span className="text-[10px] text-slate-300 font-bold">
+                        {currentIndex + 1} / {fileQueue.length}
+                      </span>
+                    </div>
+                  )}
+
                   {annotationPreviewUrl && (
                     <div className="absolute top-4 left-4 bg-black/80 backdrop-blur-sm rounded-xl p-3 border border-cyan-500/30">
                       <p className="text-[9px] text-cyan-400 font-bold uppercase mb-1">Contours</p>
@@ -554,7 +630,7 @@ export default function Accueil() {
               )}
             </div>
 
-            {/* Bouton — hauteur fixe, toujours en bas, jamais caché */}
+            {/* Bouton valider + message */}
             <div className="flex-shrink-0 flex flex-col gap-2">
               <button
                 onClick={handleUpload}
@@ -577,7 +653,9 @@ export default function Accueil() {
 
               {saveMessage && (
                 <div className={`py-2 px-4 rounded-xl text-center text-[10px] font-bold uppercase flex items-center justify-center gap-2 ${
-                  saveMessage.includes('✅') ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'
+                  saveMessage.includes('✅') ? 'bg-green-500/10 text-green-400'
+                  : saveMessage.includes('⚠️') ? 'bg-orange-500/10 text-orange-400'
+                  : 'bg-red-500/10 text-red-400'
                 }`}>
                   {saveMessage.includes('❌') && <AlertCircle size={13} />}
                   {saveMessage}
