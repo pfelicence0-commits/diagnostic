@@ -22,13 +22,14 @@ export default function Accueil() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [isChecking, setIsChecking] = useState(false); // vérification Supabase en cours
+  const [isChecking, setIsChecking] = useState(false);
+  const [isCurrentImageChecking, setIsCurrentImageChecking] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
   const [selections, setSelections] = useState({});
   const [currentUser, setCurrentUser] = useState(null);
   const [collaborator, setCollaborator] = useState(null);
   const [sessionMode, setSessionMode] = useState('solo');
-  const [importStats, setImportStats] = useState(null); // stats après import
+  const [importStats, setImportStats] = useState(null);
   
   const [annotations, setAnnotations] = useState({});
   const [showAnnotationModal, setShowAnnotationModal] = useState(false);
@@ -101,20 +102,53 @@ export default function Accueil() {
       .map(b => b.toString(16).padStart(2, '0')).join('');
   };
 
-  // ── Vérification en masse : tous les hash d'un coup ──────
-  // Récupère tous les hash existants pour ce médecin en 1 requête
-  const checkHashesBatch = async (hashes, userId) => {
+  // ── Vérification par lots de 100 (limite Supabase .in()) ──
+  // Traite les 499+ hash en plusieurs requêtes pour éviter la troncature silencieuse
+  const checkHashesBatch = async (hashes) => {
     if (!hashes.length) return new Set();
-    const { data } = await supabase
-      .from('categories_diagnostics')
-      .select('image_hash')
-      .eq('utilisateur_id', userId)
-      .in('image_hash', hashes);
-    return new Set((data || []).map(r => r.image_hash));
+
+    const SUPABASE_BATCH = 100; // limite sécurisée pour .in()
+    const allFound = new Set();
+
+    for (let i = 0; i < hashes.length; i += SUPABASE_BATCH) {
+      const lot = hashes.slice(i, i + SUPABASE_BATCH);
+      const { data, error } = await supabase
+        .from('categories_diagnostics')
+        .select('image_hash')
+        .in('image_hash', lot);
+
+      if (error) {
+        console.error(`Erreur Supabase lot ${i}–${i + SUPABASE_BATCH}:`, error);
+        continue; // on continue les autres lots même si un échoue
+      }
+
+      (data || []).forEach(r => allFound.add(r.image_hash));
+    }
+
+    return allFound;
+  };
+
+  // Vérifie si l'image courante existe déjà dans Supabase (par hash)
+  const checkCurrentImageExists = async (file) => {
+    setIsCurrentImageChecking(true);
+    try {
+      const hash = await calculateHash(file);
+      const { data } = await supabase
+        .from('categories_diagnostics')
+        .select('image_hash, maladie_nom, nom_medecin_diagnostiqueur')
+        .eq('image_hash', hash)
+        .limit(1);
+      return { hash, exists: (data && data.length > 0), info: data?.[0] || null };
+    } catch (e) {
+      console.error('Erreur vérification:', e);
+      return { hash: null, exists: false, info: null };
+    } finally {
+      setIsCurrentImageChecking(false);
+    }
   };
 
   // ════════════════════════════════════════════════════════
-  // Import du dossier avec vérification immédiate dans Supabase
+  // Import du dossier avec vérification complète par lots
   // ════════════════════════════════════════════════════════
   const handleFolderChange = async (e) => {
     const files = Array.from(e.target.files);
@@ -138,7 +172,7 @@ export default function Accueil() {
           preview,
           status:  'pending',
           name:    imageFiles[i].name,
-          hash:    null,    // sera rempli à l'étape 2
+          hash:    null,
         });
       } catch (err) {
         console.error("Erreur lecture:", imageFiles[i].name);
@@ -152,34 +186,48 @@ export default function Accueil() {
     setSelectedFile(queue[0].file);
     setSelectedImage(queue[0].preview);
     resetAnnotationState();
+    setSaveMessage('');
 
-    // ── Étape 2 : calculer les hash + vérifier dans Supabase ──
+    // Initialiser les stats avec progression à 0
+    setImportStats({
+      total:    queue.length,
+      existing: 0,
+      pending:  queue.length,
+      progress: 0,  // progression du calcul des hash
+    });
+
+    // ── Étape 2 : calculer les hash par lots de 20 ──────────
     setIsChecking(true);
     try {
-      // Calculer tous les hash en parallèle (par lots de 10)
-      const BATCH = 10;
+      const HASH_BATCH = 20; // taille des lots pour le calcul JS (mémoire)
       const withHash = [...queue];
 
-      for (let i = 0; i < withHash.length; i += BATCH) {
-        const lot = withHash.slice(i, i + BATCH);
+      for (let i = 0; i < withHash.length; i += HASH_BATCH) {
+        const lot = withHash.slice(i, i + HASH_BATCH);
         await Promise.all(lot.map(async (item) => {
           item.hash = await calculateHash(item.file);
         }));
+
+        // Mise à jour de la progression en temps réel
+        setImportStats(prev => prev ? {
+          ...prev,
+          progress: Math.min(i + HASH_BATCH, withHash.length),
+        } : null);
       }
 
-      // 1 seule requête Supabase pour tous les hash
-      const allHashes   = withHash.map(item => item.hash);
-      const existingSet = await checkHashesBatch(allHashes, currentUser?.id);
+      // ── Étape 3 : vérification Supabase par lots de 100 ───
+      // Filtre les nulls au cas où un fichier aurait échoué
+      const allHashes = withHash.map(item => item.hash).filter(Boolean);
 
-      // Marquer les images déjà présentes
+      // checkHashesBatch envoie max 100 hash par requête → gère 499+ images sans problème
+      const existingSet = await checkHashesBatch(allHashes);
+
+      // ── Étape 4 : marquer les doublons ────────────────────
       let nbExisting = 0;
       const checkedQueue = withHash.map(item => {
-        const exists = existingSet.has(item.hash);
+        const exists = item.hash && existingSet.has(item.hash);
         if (exists) nbExisting++;
-        return {
-          ...item,
-          status: exists ? 'uploaded' : 'pending',
-        };
+        return { ...item, status: exists ? 'uploaded' : 'pending' };
       });
 
       setFileQueue(checkedQueue);
@@ -187,6 +235,7 @@ export default function Accueil() {
         total:    checkedQueue.length,
         existing: nbExisting,
         pending:  checkedQueue.length - nbExisting,
+        progress: checkedQueue.length, // 100% terminé
       });
 
       // Sélectionner automatiquement la 1ère image NON encore traitée
@@ -195,6 +244,8 @@ export default function Accueil() {
         setCurrentIndex(firstPending);
         setSelectedFile(checkedQueue[firstPending].file);
         setSelectedImage(checkedQueue[firstPending].preview);
+      } else {
+        setSaveMessage('✅ Toutes les images ont déjà été traitées !');
       }
 
     } catch (err) {
@@ -300,7 +351,6 @@ export default function Accueil() {
   };
 
   const goToNext = (currentQueue, currentIdx) => {
-    // Chercher la prochaine image non encore traitée
     const nextPending = currentQueue.findIndex(
       (item, i) => i > currentIdx && item.status === 'pending'
     );
@@ -313,7 +363,6 @@ export default function Accueil() {
       resetAnnotationState();
       setSaveMessage('');
     } else {
-      // Plus d'images en attente
       setSaveMessage('✅ Toutes les images ont été traitées !');
       setTimeout(() => handleClearQueue(), 2500);
     }
@@ -364,10 +413,34 @@ export default function Accueil() {
       const currentItem = fileQueue[currentIndex];
       const imageHash   = currentItem.hash || await calculateHash(selectedFile);
 
-      // Vérif doublon (au cas où le hash n'était pas encore calculé)
       if (currentItem.status === 'uploaded') {
         setSaveMessage(`⚠️ Image déjà enregistrée — passage à la suivante...`);
         setTimeout(() => goToNext(fileQueue, currentIndex), 1500);
+        setIsSaving(false);
+        return;
+      }
+
+      // Vérification finale anti-doublon juste avant l'upload
+      const { data: existCheck } = await supabase
+        .from('categories_diagnostics')
+        .select('image_hash, maladie_nom, nom_medecin_diagnostiqueur')
+        .eq('image_hash', imageHash)
+        .limit(1);
+
+      if (existCheck && existCheck.length > 0) {
+        const info = existCheck[0];
+        // Marquer dans la queue
+        const updatedQueue = fileQueue.map((item, i) =>
+          i === currentIndex ? { ...item, status: 'uploaded', hash: imageHash } : item
+        );
+        setFileQueue(updatedQueue);
+        setImportStats(prev => prev ? {
+          ...prev,
+          existing: prev.existing + 1,
+          pending:  Math.max(0, prev.pending - 1),
+        } : null);
+        setSaveMessage(`⚠️ Image déjà enregistrée (par ${info.nom_medecin_diagnostiqueur || 'un médecin'} — ${info.maladie_nom || ''}) — passage à la suivante...`);
+        setTimeout(() => goToNext(updatedQueue, currentIndex), 2000);
         setIsSaving(false);
         return;
       }
@@ -400,7 +473,6 @@ export default function Accueil() {
         const { data: { publicUrl } } = supabase.storage
           .from('images').getPublicUrl(storagePath);
 
-        // Si "Autre" est sélectionné, on intègre la description dans stade_nom
         const stadeInsert = selectedDiseases.includes('Autre') && autreDescription.trim()
           ? stadeLabel.replace('Aucun', autreDescription.trim())
           : stadeLabel;
@@ -447,11 +519,10 @@ export default function Accueil() {
       }
 
       const updatedQueue = fileQueue.map((item, i) =>
-        i === currentIndex ? { ...item, status: 'uploaded' } : item
+        i === currentIndex ? { ...item, status: 'uploaded', hash: imageHash } : item
       );
       setFileQueue(updatedQueue);
 
-      // Mettre à jour les stats
       setImportStats(prev => prev ? {
         ...prev,
         existing: prev.existing + 1,
@@ -502,9 +573,24 @@ export default function Accueil() {
           {importStats && (
             <div className="px-3 py-2 border-b border-white/10 flex-shrink-0 space-y-1">
               {isChecking ? (
-                <div className="flex items-center gap-2">
-                  <Activity size={11} className="animate-spin text-cyan-400" />
-                  <span className="text-[9px] text-cyan-400">Vérification...</span>
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-2">
+                    <Activity size={11} className="animate-spin text-cyan-400" />
+                    <span className="text-[9px] text-cyan-400">Vérification...</span>
+                  </div>
+                  {/* Barre de progression du calcul des hash */}
+                  <div className="flex justify-between items-center">
+                    <span className="text-[9px] text-slate-500">Hash calculés</span>
+                    <span className="text-[9px] text-slate-400">
+                      {importStats.progress || 0} / {importStats.total}
+                    </span>
+                  </div>
+                  <div className="w-full bg-slate-700 rounded-full h-1">
+                    <div
+                      className="bg-cyan-400 h-1 rounded-full transition-all duration-300"
+                      style={{ width: `${((importStats.progress || 0) / importStats.total) * 100}%` }}
+                    />
+                  </div>
                 </div>
               ) : (
                 <>
@@ -522,11 +608,11 @@ export default function Accueil() {
                     <span className="text-[9px] text-cyan-400">À traiter</span>
                     <span className="text-[9px] font-bold text-cyan-400">{importStats.pending}</span>
                   </div>
-                  {/* Barre de progression */}
+                  {/* Barre de progression globale */}
                   <div className="w-full bg-slate-700 rounded-full h-1 mt-1">
                     <div
                       className="bg-green-400 h-1 rounded-full transition-all"
-                      style={{ width: `${(importStats.existing / importStats.total) * 100}%` }}
+                      style={{ width: `${importStats.total > 0 ? (importStats.existing / importStats.total) * 100 : 0}%` }}
                     />
                   </div>
                 </>
@@ -534,7 +620,7 @@ export default function Accueil() {
             </div>
           )}
 
-          {/* Indicateur de vérification en cours */}
+          {/* Indicateur de vérification en cours (avant que importStats soit défini) */}
           {isChecking && !importStats && (
             <div className="px-3 py-2 border-b border-white/10 flex-shrink-0 flex items-center gap-2">
               <Activity size={11} className="animate-spin text-cyan-400" />
@@ -558,7 +644,7 @@ export default function Accueil() {
               fileQueue.map((item, idx) => (
                 <div
                   key={idx}
-                  onClick={() => {
+                  onClick={async () => {
                     if (!isSaving) {
                       setCurrentIndex(idx);
                       setSelectedFile(item.file);
@@ -566,6 +652,21 @@ export default function Accueil() {
                       resetAnnotationState();
                       setSelections({});
                       setAutreDescription('');
+                      setSaveMessage('');
+                      // Vérifier si cette image existe déjà dans Supabase (si pas encore fait)
+                      if (item.status !== 'uploaded') {
+                        const { exists, hash, info } = await checkCurrentImageExists(item.file);
+                        if (exists) {
+                          setFileQueue(prev => prev.map((q, i) =>
+                            i === idx ? { ...q, status: 'uploaded', hash } : q
+                          ));
+                          setSaveMessage(`⚠️ Image déjà enregistrée (diagnostiquée par ${info?.nom_medecin_diagnostiqueur || 'un médecin'} — ${info?.maladie_nom || ''})`);
+                        } else if (hash) {
+                          setFileQueue(prev => prev.map((q, i) =>
+                            i === idx ? { ...q, hash } : q
+                          ));
+                        }
+                      }
                     }
                   }}
                   className={`relative cursor-pointer rounded-xl overflow-hidden border-2 flex-shrink-0 transition-all ${
@@ -576,7 +677,7 @@ export default function Accueil() {
                 >
                   <img src={item.preview} alt="mini" className="w-full h-20 object-cover" />
 
-                  {/* ── Tic vert : image déjà dans Supabase ── */}
+                  {/* Tic vert : image déjà dans Supabase */}
                   {item.status === 'uploaded' && (
                     <div className="absolute inset-0 bg-green-500/60 flex flex-col items-center justify-center gap-1">
                       <CheckCircle2 size={22} className="text-white drop-shadow" />
@@ -594,7 +695,7 @@ export default function Accueil() {
                     </div>
                   )}
 
-                  {/* Spinner pendant la vérification */}
+                  {/* Spinner pendant la vérification batch */}
                   {isChecking && item.status === 'pending' && (
                     <div className="absolute bottom-1 right-1">
                       <Activity size={10} className="animate-spin text-cyan-300" />
@@ -782,8 +883,17 @@ export default function Accueil() {
                     alt="Current"
                   />
 
-                  {/* Badge "déjà enregistrée" sur l'image */}
-                  {currentItemIsAlreadyUploaded && (
+                  {/* Overlay vérification en cours */}
+                  {isCurrentImageChecking && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/50">
+                      <div className="bg-slate-800/90 backdrop-blur-sm rounded-2xl px-6 py-4 flex flex-col items-center gap-3 border border-cyan-500/30">
+                        <Activity size={32} className="animate-spin text-cyan-400" />
+                        <p className="text-cyan-400 font-bold text-xs uppercase">Vérification Supabase...</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {!isCurrentImageChecking && currentItemIsAlreadyUploaded && (
                     <div className="absolute inset-0 flex items-center justify-center bg-black/40">
                       <div className="bg-green-500/90 backdrop-blur-sm rounded-2xl px-6 py-4 flex flex-col items-center gap-2 border border-green-400/50">
                         <CheckCircle2 size={36} className="text-white" />
@@ -834,14 +944,14 @@ export default function Accueil() {
               <button
                 onClick={handleUpload}
                 disabled={
-                  isSaving || isChecking || !selectedFile ||
+                  isSaving || isChecking || isCurrentImageChecking || !selectedFile ||
                   currentItemIsAlreadyUploaded ||
                   selectedDiseases.length === 0 ||
                   !selectedDiseases.every(d => annotations[d]) ||
                   (selectedDiseases.includes('Autre') && !autreDescription.trim())
                 }
                 className={`w-full py-4 rounded-2xl font-black text-sm uppercase tracking-tighter transition-all ${
-                  isSaving || isChecking || !selectedFile ||
+                  isSaving || isChecking || isCurrentImageChecking || !selectedFile ||
                   currentItemIsAlreadyUploaded ||
                   selectedDiseases.length === 0 ||
                   !selectedDiseases.every(d => annotations[d]) ||
@@ -854,7 +964,7 @@ export default function Accueil() {
                   ? <Activity className="animate-spin mx-auto" />
                   : isChecking
                     ? <span className="flex items-center justify-center gap-2">
-                        <Activity size={14} className="animate-spin" /> Vérification...
+                        <Activity size={14} className="animate-spin" /> Vérification en cours...
                       </span>
                     : currentItemIsAlreadyUploaded
                       ? '✓ Image déjà enregistrée'
