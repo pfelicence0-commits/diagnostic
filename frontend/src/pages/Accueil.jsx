@@ -22,18 +22,18 @@ export default function Accueil() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [isChecking, setIsChecking] = useState(false); // vérification Supabase en cours
   const [saveMessage, setSaveMessage] = useState('');
   const [selections, setSelections] = useState({});
   const [currentUser, setCurrentUser] = useState(null);
   const [collaborator, setCollaborator] = useState(null);
   const [sessionMode, setSessionMode] = useState('solo');
+  const [importStats, setImportStats] = useState(null); // stats après import
   
   const [annotations, setAnnotations] = useState({});
   const [showAnnotationModal, setShowAnnotationModal] = useState(false);
   const [currentAnnotatingDisease, setCurrentAnnotatingDisease] = useState(null);
   const [annotationPreviewUrl, setAnnotationPreviewUrl] = useState('');
-
-  // ── Champ texte libre pour "Autre" ──────────────────────
   const [autreDescription, setAutreDescription] = useState('');
 
   useEffect(() => {
@@ -62,6 +62,7 @@ export default function Accueil() {
     setSelections({});
     setSaveMessage('');
     setAutreDescription('');
+    setImportStats(null);
     resetAnnotationState();
   };
 
@@ -92,6 +93,29 @@ export default function Accueil() {
     return URL.createObjectURL(file);
   };
 
+  // ── Calcul SHA-256 d'un fichier ──────────────────────────
+  const calculateHash = async (file) => {
+    const buffer = await file.arrayBuffer();
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    return Array.from(new Uint8Array(hashBuffer))
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+  };
+
+  // ── Vérification en masse : tous les hash d'un coup ──────
+  // Récupère tous les hash existants pour ce médecin en 1 requête
+  const checkHashesBatch = async (hashes, userId) => {
+    if (!hashes.length) return new Set();
+    const { data } = await supabase
+      .from('categories_diagnostics')
+      .select('image_hash')
+      .eq('utilisateur_id', userId)
+      .in('image_hash', hashes);
+    return new Set((data || []).map(r => r.image_hash));
+  };
+
+  // ════════════════════════════════════════════════════════
+  // Import du dossier avec vérification immédiate dans Supabase
+  // ════════════════════════════════════════════════════════
   const handleFolderChange = async (e) => {
     const files = Array.from(e.target.files);
     const allowedExtensions = ['jpg', 'jpeg', 'png', 'tif', 'tiff', 'webp', 'bmp'];
@@ -100,21 +124,83 @@ export default function Accueil() {
       return allowedExtensions.includes(ext) || file.type.startsWith('image/');
     });
 
-    if (imageFiles.length > 0) {
-      setIsLoading(true);
-      const queue = [];
-      for (let i = 0; i < imageFiles.length; i++) {
-        try {
-          const preview = await processFileToPreview(imageFiles[i]);
-          queue.push({ id: i, file: imageFiles[i], preview, status: 'pending', name: imageFiles[i].name });
-        } catch (err) { console.error("Erreur lecture:", imageFiles[i].name); }
+    if (imageFiles.length === 0) return;
+
+    // ── Étape 1 : générer les previews ──────────────────────
+    setIsLoading(true);
+    const queue = [];
+    for (let i = 0; i < imageFiles.length; i++) {
+      try {
+        const preview = await processFileToPreview(imageFiles[i]);
+        queue.push({
+          id:      i,
+          file:    imageFiles[i],
+          preview,
+          status:  'pending',
+          name:    imageFiles[i].name,
+          hash:    null,    // sera rempli à l'étape 2
+        });
+      } catch (err) {
+        console.error("Erreur lecture:", imageFiles[i].name);
       }
-      setFileQueue(queue);
-      setCurrentIndex(0);
-      setSelectedFile(queue[0].file);
-      setSelectedImage(queue[0].preview);
-      setIsLoading(false);
-      resetAnnotationState();
+    }
+    setIsLoading(false);
+
+    // Afficher la galerie immédiatement (sans attendre la vérif)
+    setFileQueue(queue);
+    setCurrentIndex(0);
+    setSelectedFile(queue[0].file);
+    setSelectedImage(queue[0].preview);
+    resetAnnotationState();
+
+    // ── Étape 2 : calculer les hash + vérifier dans Supabase ──
+    setIsChecking(true);
+    try {
+      // Calculer tous les hash en parallèle (par lots de 10)
+      const BATCH = 10;
+      const withHash = [...queue];
+
+      for (let i = 0; i < withHash.length; i += BATCH) {
+        const lot = withHash.slice(i, i + BATCH);
+        await Promise.all(lot.map(async (item) => {
+          item.hash = await calculateHash(item.file);
+        }));
+      }
+
+      // 1 seule requête Supabase pour tous les hash
+      const allHashes   = withHash.map(item => item.hash);
+      const existingSet = await checkHashesBatch(allHashes, currentUser?.id);
+
+      // Marquer les images déjà présentes
+      let nbExisting = 0;
+      const checkedQueue = withHash.map(item => {
+        const exists = existingSet.has(item.hash);
+        if (exists) nbExisting++;
+        return {
+          ...item,
+          status: exists ? 'uploaded' : 'pending',
+        };
+      });
+
+      setFileQueue(checkedQueue);
+      setImportStats({
+        total:    checkedQueue.length,
+        existing: nbExisting,
+        pending:  checkedQueue.length - nbExisting,
+      });
+
+      // Sélectionner automatiquement la 1ère image NON encore traitée
+      const firstPending = checkedQueue.findIndex(item => item.status === 'pending');
+      if (firstPending !== -1) {
+        setCurrentIndex(firstPending);
+        setSelectedFile(checkedQueue[firstPending].file);
+        setSelectedImage(checkedQueue[firstPending].preview);
+      }
+
+    } catch (err) {
+      console.error("Erreur vérification Supabase:", err);
+    } finally {
+      setIsChecking(false);
     }
   };
 
@@ -141,7 +227,6 @@ export default function Accueil() {
         return;
       }
       newSels[diseaseName] = { stage: 'Aucun' };
-      // Réinitialiser le texte libre si on décoche Autre
     } else {
       delete newSels[diseaseName];
       if (diseaseName === 'Autre') setAutreDescription('');
@@ -214,43 +299,29 @@ export default function Accueil() {
     setCurrentAnnotatingDisease(null);
   };
 
-  const calculateHash = async (file) => {
-    const buffer = await file.arrayBuffer();
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-    return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-  };
-
-  const checkImageAlreadyExists = async (imageHash, userId) => {
-    const { count } = await supabase
-      .from('categories_diagnostics')
-      .select('*', { count: 'exact', head: true })
-      .eq('image_hash', imageHash)
-      .eq('utilisateur_id', userId);
-    return (count || 0) > 0;
-  };
-
   const goToNext = (currentQueue, currentIdx) => {
-    const next = currentIdx + 1;
-    if (next < currentQueue.length) {
-      setCurrentIndex(next);
-      setSelectedFile(currentQueue[next].file);
-      setSelectedImage(currentQueue[next].preview);
+    // Chercher la prochaine image non encore traitée
+    const nextPending = currentQueue.findIndex(
+      (item, i) => i > currentIdx && item.status === 'pending'
+    );
+    if (nextPending !== -1) {
+      setCurrentIndex(nextPending);
+      setSelectedFile(currentQueue[nextPending].file);
+      setSelectedImage(currentQueue[nextPending].preview);
       setSelections({});
       setAutreDescription('');
       resetAnnotationState();
       setSaveMessage('');
     } else {
-      setTimeout(() => {
-        handleClearQueue();
-        setSaveMessage('');
-      }, 1500);
+      // Plus d'images en attente
+      setSaveMessage('✅ Toutes les images ont été traitées !');
+      setTimeout(() => handleClearQueue(), 2500);
     }
   };
 
   const buildRenamedFileName = async (selectedDiseases, selectionsData, docId, fileExt) => {
     const diseaseParts = selectedDiseases.map(diseaseName => {
       const stage = selectionsData[diseaseName]?.stage || 'Aucun';
-      // Pour Autre, on utilise la description saisie
       if (diseaseName === 'Autre' && autreDescription.trim()) {
         return `Autre_${autreDescription.trim().replace(/\s+/g, '-')}`;
       }
@@ -277,13 +348,10 @@ export default function Accueil() {
       setSaveMessage("⚠️ Sélectionnez au moins une maladie");
       return;
     }
-
-    // ── Vérifier que la description Autre est remplie si sélectionné ──
     if (selectedDiseases.includes('Autre') && !autreDescription.trim()) {
       setSaveMessage("⚠️ Précisez la pathologie dans le champ « Autre »");
       return;
     }
-
     for (const disease of selectedDiseases) {
       if (!annotations[disease]) {
         setSaveMessage(`⚠️ Dessinez le contour pour ${disease}`);
@@ -293,15 +361,13 @@ export default function Accueil() {
 
     setIsSaving(true);
     try {
-      const imageHash = await calculateHash(selectedFile);
+      const currentItem = fileQueue[currentIndex];
+      const imageHash   = currentItem.hash || await calculateHash(selectedFile);
 
-      const alreadyExists = await checkImageAlreadyExists(imageHash, currentUser.id);
-      if (alreadyExists) {
+      // Vérif doublon (au cas où le hash n'était pas encore calculé)
+      if (currentItem.status === 'uploaded') {
         setSaveMessage(`⚠️ Image déjà enregistrée — passage à la suivante...`);
-        setFileQueue(prev =>
-          prev.map((item, i) => i === currentIndex ? { ...item, status: 'duplicate' } : item)
-        );
-        setTimeout(() => goToNext(fileQueue, currentIndex), 2000);
+        setTimeout(() => goToNext(fileQueue, currentIndex), 1500);
         setIsSaving(false);
         return;
       }
@@ -316,13 +382,11 @@ export default function Accueil() {
         combinedAnnotBlob = await (await fetch(annotationPreviewUrl)).blob();
       }
 
-      // ── Label maladie : si Autre, inclure la description ──
       const maladieLabel = selectedDiseases.map(d =>
         d === 'Autre' && autreDescription.trim()
           ? `Autre (${autreDescription.trim()})`
           : d
       ).join(' + ');
-
       const stadeLabel = selectedDiseases.map(d => selections[d]?.stage || 'Aucun').join(' / ');
 
       for (const doc of doctors) {
@@ -336,6 +400,11 @@ export default function Accueil() {
         const { data: { publicUrl } } = supabase.storage
           .from('images').getPublicUrl(storagePath);
 
+        // Si "Autre" est sélectionné, on intègre la description dans stade_nom
+        const stadeInsert = selectedDiseases.includes('Autre') && autreDescription.trim()
+          ? stadeLabel.replace('Aucun', autreDescription.trim())
+          : stadeLabel;
+
         const { data: diagData, error: diagErr } = await supabase
           .from('categories_diagnostics')
           .insert([{
@@ -344,17 +413,12 @@ export default function Accueil() {
             utilisateur_id:             doc.id,
             nom_medecin_diagnostiqueur: `${doc.prenom} ${doc.nom}`,
             maladie_nom:                maladieLabel,
-            stade_nom:                  stadeLabel,
+            stade_nom:                  stadeInsert,
             nom_image_originale:        selectedFile.name,
             nom_image_renommee:         nomRenomme,
             path_image_final:           storagePath,
-            // ── Champ dédié pour la description Autre ──
-            autre_description:          selectedDiseases.includes('Autre')
-                                          ? autreDescription.trim()
-                                          : null,
           }])
-          .select()
-          .single();
+          .select().single();
 
         if (diagErr) throw diagErr;
 
@@ -368,18 +432,15 @@ export default function Accueil() {
               .from('images').getPublicUrl(annotPath);
 
             for (const diseaseName of selectedDiseases) {
-              const { error: annotErr } = await supabase
-                .from('annotations_maladie')
-                .insert([{
-                  diagnostic_id:        diagData.id,
-                  image_hash:           imageHash,
-                  utilisateur_id:       doc.id,
-                  image_original_url:   publicUrl,
-                  annotated_image_path: annotPath,
-                  annotated_image_url:  annotPublicUrl,
-                  annotation_details:   annotations[diseaseName],
-                }]);
-              if (annotErr) console.warn(`Annotation (${diseaseName}) insert error:`, annotErr.message);
+              await supabase.from('annotations_maladie').insert([{
+                diagnostic_id:        diagData.id,
+                image_hash:           imageHash,
+                utilisateur_id:       doc.id,
+                image_original_url:   publicUrl,
+                annotated_image_path: annotPath,
+                annotated_image_url:  annotPublicUrl,
+                annotation_details:   annotations[diseaseName],
+              }]);
             }
           }
         }
@@ -389,18 +450,16 @@ export default function Accueil() {
         i === currentIndex ? { ...item, status: 'uploaded' } : item
       );
       setFileQueue(updatedQueue);
-      setSaveMessage(`✅ ${selectedDiseases.length} maladie(s) enregistrée(s) !`);
 
-      const allDone = updatedQueue.every(item =>
-        item.status === 'uploaded' || item.status === 'duplicate'
-      );
+      // Mettre à jour les stats
+      setImportStats(prev => prev ? {
+        ...prev,
+        existing: prev.existing + 1,
+        pending:  Math.max(0, prev.pending - 1),
+      } : null);
 
-      if (allDone) {
-        setSaveMessage(`✅ Toutes les images ont été enregistrées !`);
-        setTimeout(() => handleClearQueue(), 2500);
-      } else {
-        setTimeout(() => goToNext(updatedQueue, currentIndex), 1500);
-      }
+      setSaveMessage(`✅ Enregistré !`);
+      setTimeout(() => goToNext(updatedQueue, currentIndex), 1200);
 
     } catch (err) {
       setSaveMessage(`❌ Erreur: ${err.message}`);
@@ -410,6 +469,7 @@ export default function Accueil() {
   };
 
   const selectedDiseases = Object.keys(selections);
+  const currentItemIsAlreadyUploaded = currentIndex !== null && fileQueue[currentIndex]?.status === 'uploaded';
 
   return (
     <div className="h-screen flex flex-col bg-[#0f172a] text-white font-sans overflow-hidden">
@@ -419,6 +479,8 @@ export default function Accueil() {
 
         {/* ── GALERIE ── */}
         <div className="w-48 flex-shrink-0 flex flex-col bg-slate-800/50 rounded-3xl border border-white/10 overflow-hidden">
+
+          {/* En-tête */}
           <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10 flex-shrink-0">
             <ImageIcon size={15} className="text-cyan-400 flex-shrink-0" />
             <h2 className="text-[10px] font-bold uppercase tracking-widest truncate flex-1">
@@ -436,10 +498,56 @@ export default function Accueil() {
             )}
           </div>
 
+          {/* ── Bandeau stats après import ── */}
+          {importStats && (
+            <div className="px-3 py-2 border-b border-white/10 flex-shrink-0 space-y-1">
+              {isChecking ? (
+                <div className="flex items-center gap-2">
+                  <Activity size={11} className="animate-spin text-cyan-400" />
+                  <span className="text-[9px] text-cyan-400">Vérification...</span>
+                </div>
+              ) : (
+                <>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[9px] text-slate-400">Total</span>
+                    <span className="text-[9px] font-bold text-white">{importStats.total}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[9px] text-green-400 flex items-center gap-1">
+                      <CheckCircle2 size={9} /> Déjà faites
+                    </span>
+                    <span className="text-[9px] font-bold text-green-400">{importStats.existing}</span>
+                  </div>
+                  <div className="flex justify-between items-center">
+                    <span className="text-[9px] text-cyan-400">À traiter</span>
+                    <span className="text-[9px] font-bold text-cyan-400">{importStats.pending}</span>
+                  </div>
+                  {/* Barre de progression */}
+                  <div className="w-full bg-slate-700 rounded-full h-1 mt-1">
+                    <div
+                      className="bg-green-400 h-1 rounded-full transition-all"
+                      style={{ width: `${(importStats.existing / importStats.total) * 100}%` }}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Indicateur de vérification en cours */}
+          {isChecking && !importStats && (
+            <div className="px-3 py-2 border-b border-white/10 flex-shrink-0 flex items-center gap-2">
+              <Activity size={11} className="animate-spin text-cyan-400" />
+              <span className="text-[9px] text-cyan-400">Vérification Supabase...</span>
+            </div>
+          )}
+
+          {/* Liste images */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar min-h-0">
             {isLoading ? (
-              <div className="flex items-center justify-center py-10">
+              <div className="flex flex-col items-center justify-center py-10 gap-2">
                 <Activity className="animate-spin text-cyan-400" size={24} />
+                <span className="text-[9px] text-slate-400">Chargement...</span>
               </div>
             ) : fileQueue.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-10 gap-2 text-slate-600">
@@ -461,19 +569,35 @@ export default function Accueil() {
                     }
                   }}
                   className={`relative cursor-pointer rounded-xl overflow-hidden border-2 flex-shrink-0 transition-all ${
-                    currentIndex === idx ? 'border-cyan-400 opacity-100' : 'border-transparent opacity-40 hover:opacity-60'
+                    currentIndex === idx
+                      ? 'border-cyan-400 opacity-100'
+                      : 'border-transparent opacity-50 hover:opacity-70'
                   }`}
                 >
                   <img src={item.preview} alt="mini" className="w-full h-20 object-cover" />
+
+                  {/* ── Tic vert : image déjà dans Supabase ── */}
                   {item.status === 'uploaded' && (
-                    <div className="absolute inset-0 bg-green-500/70 flex items-center justify-center">
-                      <CheckCircle2 size={22} className="text-white" />
+                    <div className="absolute inset-0 bg-green-500/60 flex flex-col items-center justify-center gap-1">
+                      <CheckCircle2 size={22} className="text-white drop-shadow" />
+                      <span className="text-[7px] text-white font-bold uppercase tracking-wide">
+                        Déjà enregistrée
+                      </span>
                     </div>
                   )}
+
+                  {/* Badge doublon (détecté pendant upload) */}
                   {item.status === 'duplicate' && (
                     <div className="absolute inset-0 bg-orange-500/70 flex flex-col items-center justify-center gap-1">
                       <AlertCircle size={18} className="text-white" />
-                      <span className="text-[8px] text-white font-bold uppercase">Doublon</span>
+                      <span className="text-[7px] text-white font-bold uppercase">Doublon</span>
+                    </div>
+                  )}
+
+                  {/* Spinner pendant la vérification */}
+                  {isChecking && item.status === 'pending' && (
+                    <div className="absolute bottom-1 right-1">
+                      <Activity size={10} className="animate-spin text-cyan-300" />
                     </div>
                   )}
                 </div>
@@ -494,6 +618,20 @@ export default function Accueil() {
             </div>
 
             <div className="flex-1 overflow-y-auto px-6 pb-6 space-y-3 custom-scrollbar min-h-0">
+
+              {/* Message si image déjà traitée */}
+              {currentItemIsAlreadyUploaded && (
+                <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-2xl flex items-center gap-3">
+                  <CheckCircle2 size={20} className="text-green-400 flex-shrink-0" />
+                  <div>
+                    <p className="text-[11px] text-green-400 font-bold">Image déjà enregistrée</p>
+                    <p className="text-[9px] text-slate-400 mt-0.5">
+                      Cette image a déjà été diagnostiquée. Sélectionnez une autre image dans la galerie.
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {selectedDiseases.length > 0 && (
                 <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-xl">
                   <p className="text-[9px] text-blue-400 font-bold uppercase mb-2">Légende</p>
@@ -529,11 +667,13 @@ export default function Accueil() {
                   <div
                     key={idx}
                     className={`p-4 border rounded-2xl transition-all ${
-                      isSelected
-                        ? 'border-cyan-400 bg-cyan-400/5'
-                        : !canCheck && selectedDiseases.length > 0
-                          ? 'border-white/5 bg-white/5 opacity-40'
-                          : 'border-white/5 bg-white/5'
+                      currentItemIsAlreadyUploaded
+                        ? 'border-white/5 bg-white/5 opacity-30 pointer-events-none'
+                        : isSelected
+                          ? 'border-cyan-400 bg-cyan-400/5'
+                          : !canCheck && selectedDiseases.length > 0
+                            ? 'border-white/5 bg-white/5 opacity-40'
+                            : 'border-white/5 bg-white/5'
                     }`}
                   >
                     <div className="flex items-center gap-3">
@@ -549,14 +689,13 @@ export default function Accueil() {
                         type="checkbox"
                         className="w-5 h-5 accent-cyan-400 flex-shrink-0"
                         checked={isSelected}
-                        disabled={!isSelected && !canCheck}
+                        disabled={currentItemIsAlreadyUploaded || (!isSelected && !canCheck)}
                         onChange={(e) => handleDiseaseCheck(cat.name, e.target.checked)}
                       />
                     </div>
 
                     {isSelected && (
                       <>
-                        {/* ── Champ texte pour Autre ── */}
                         {isAutre && (
                           <div className="mt-3">
                             <label className="text-[9px] text-slate-400 uppercase font-bold block mb-1">
@@ -575,20 +714,13 @@ export default function Accueil() {
                                   : 'border-red-500/40 focus:border-red-400'
                                 }`}
                             />
-                            {!autreDescription.trim() && (
-                              <p className="text-[8px] text-red-400 mt-1">
-                                ⚠️ Champ obligatoire
-                              </p>
-                            )}
-                            {autreDescription.trim() && (
-                              <p className="text-[8px] text-green-400 mt-1">
-                                ✓ "{autreDescription.trim()}"
-                              </p>
-                            )}
+                            {!autreDescription.trim()
+                              ? <p className="text-[8px] text-red-400 mt-1">⚠️ Champ obligatoire</p>
+                              : <p className="text-[8px] text-green-400 mt-1">✓ "{autreDescription.trim()}"</p>
+                            }
                           </div>
                         )}
 
-                        {/* Stade si applicable */}
                         {cat.options[0] !== 'Aucun' && (
                           <select
                             className="mt-3 bg-slate-900 text-[10px] p-2 rounded-lg border border-cyan-500/30 w-full text-cyan-100"
@@ -600,7 +732,6 @@ export default function Accueil() {
                           </select>
                         )}
 
-                        {/* Bouton annotation */}
                         <button
                           onClick={() => handleOpenAnnotation(cat.name)}
                           disabled={!canDraw || (isAutre && !autreDescription.trim())}
@@ -650,6 +781,19 @@ export default function Accueil() {
                     className="w-full h-full object-contain"
                     alt="Current"
                   />
+
+                  {/* Badge "déjà enregistrée" sur l'image */}
+                  {currentItemIsAlreadyUploaded && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+                      <div className="bg-green-500/90 backdrop-blur-sm rounded-2xl px-6 py-4 flex flex-col items-center gap-2 border border-green-400/50">
+                        <CheckCircle2 size={36} className="text-white" />
+                        <p className="text-white font-black text-sm uppercase">Déjà enregistrée</p>
+                        <p className="text-green-100 text-[10px]">Cette image a déjà été diagnostiquée</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Compteur */}
                   {fileQueue.length > 0 && currentIndex !== null && (
                     <div className="absolute bottom-4 right-4 bg-black/70 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-white/10">
                       <span className="text-[10px] text-slate-300 font-bold">
@@ -657,7 +801,8 @@ export default function Accueil() {
                       </span>
                     </div>
                   )}
-                  {annotationPreviewUrl && (
+
+                  {annotationPreviewUrl && !currentItemIsAlreadyUploaded && (
                     <div className="absolute top-4 left-4 bg-black/80 backdrop-blur-sm rounded-xl p-3 border border-cyan-500/30">
                       <p className="text-[9px] text-cyan-400 font-bold uppercase mb-1">Contours</p>
                       <div className="space-y-1">
@@ -684,17 +829,21 @@ export default function Accueil() {
               )}
             </div>
 
+            {/* Bouton valider */}
             <div className="flex-shrink-0 flex flex-col gap-2">
               <button
                 onClick={handleUpload}
                 disabled={
-                  isSaving || !selectedFile ||
+                  isSaving || isChecking || !selectedFile ||
+                  currentItemIsAlreadyUploaded ||
                   selectedDiseases.length === 0 ||
                   !selectedDiseases.every(d => annotations[d]) ||
                   (selectedDiseases.includes('Autre') && !autreDescription.trim())
                 }
                 className={`w-full py-4 rounded-2xl font-black text-sm uppercase tracking-tighter transition-all ${
-                  isSaving || !selectedFile || selectedDiseases.length === 0 ||
+                  isSaving || isChecking || !selectedFile ||
+                  currentItemIsAlreadyUploaded ||
+                  selectedDiseases.length === 0 ||
                   !selectedDiseases.every(d => annotations[d]) ||
                   (selectedDiseases.includes('Autre') && !autreDescription.trim())
                     ? 'bg-slate-800 opacity-50 cursor-not-allowed'
@@ -703,7 +852,13 @@ export default function Accueil() {
               >
                 {isSaving
                   ? <Activity className="animate-spin mx-auto" />
-                  : `Valider ${selectedDiseases.length} maladie(s)`
+                  : isChecking
+                    ? <span className="flex items-center justify-center gap-2">
+                        <Activity size={14} className="animate-spin" /> Vérification...
+                      </span>
+                    : currentItemIsAlreadyUploaded
+                      ? '✓ Image déjà enregistrée'
+                      : `Valider ${selectedDiseases.length} maladie(s)`
                 }
               </button>
 
