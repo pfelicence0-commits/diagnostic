@@ -27,7 +27,6 @@ const MesImages = () => {
 
   const [newDiseaseName, setNewDiseaseName] = useState('OMA');
   const [newDiseaseType, setNewDiseaseType] = useState('Standard');
-  // Sélections multiples pour le mode ajout d'avis
   const [multiSelections, setMultiSelections] = useState({});
   const [showAvisInfo, setShowAvisInfo] = useState(false);
   const [password, setPassword]           = useState('');
@@ -148,19 +147,13 @@ const MesImages = () => {
   useEffect(() => { if (currentUserId) fetchData(); }, [currentUserId]);
 
   const normalizeAvis = (maladie_nom, stade_nom) => {
-    // Séparer les maladies et les stades
     const maladies = (maladie_nom || '').split('+').map(m => m.trim());
     const stades   = (stade_nom   || '').split('/').map(s => s.trim());
-
-    // Associer chaque maladie à son stade correspondant
     const pairs = maladies.map((m, i) => ({
       maladie: m.toLowerCase(),
       stade:   (stades[i] || 'standard').toLowerCase().replace('aucun', 'standard'),
     }));
-
-    // Trier par nom de maladie pour ignorer l'ordre d'ajout
     pairs.sort((a, b) => a.maladie.localeCompare(b.maladie));
-
     return pairs.map(p => `${p.maladie}|${p.stade}`).join('::');
   };
 
@@ -184,6 +177,10 @@ const MesImages = () => {
       return diseaseMatch && doctorMatch;
     })
   );
+
+  /* ─── Compteurs ─── */
+  const myDiagnosticsCount = myGroups.length;       // total images dans "Mes diagnostics"
+  const filteredCount      = filteredData.length;   // images affichées après filtres
 
   /* ─── Auth ─── */
   const verifyPassword = async (pwd) => {
@@ -224,7 +221,6 @@ const MesImages = () => {
           canvas.height = img.naturalHeight;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0);
-
           const points = payload.points_pixels || [];
           if (points.length >= 3) {
             ctx.beginPath();
@@ -239,7 +235,6 @@ const MesImages = () => {
             ctx.lineWidth = Math.max(2, Math.round(Math.min(img.naturalWidth, img.naturalHeight) * 0.003));
             ctx.stroke();
           }
-
           resolve(canvas.toDataURL('image/png', 1.0));
         } catch (e) {
           reject(e);
@@ -285,28 +280,20 @@ const MesImages = () => {
       .order('id', { ascending: false })
       .limit(1)
       .single();
-
     if (error) throw error;
     return data?.id;
   };
 
   const saveAnnotationRecord = async ({ diagnosticId, imageHash }) => {
     if (!annotationPayload || !annotationPreviewUrl || !diagnosticId) return;
-
     const fileName = `annotation_${Date.now()}_${currentUserId}.png`;
     const storagePath = `annotations/${imageHash}/${fileName}`;
     const blob = await dataUrlToBlob(annotationPreviewUrl);
-
     const { error: uploadError } = await supabase.storage
       .from('images')
-      .upload(storagePath, blob, {
-        contentType: 'image/png',
-        upsert: true,
-      });
+      .upload(storagePath, blob, { contentType: 'image/png', upsert: true });
     if (uploadError) throw uploadError;
-
     const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(storagePath);
-
     const { error: annotationInsertError } = await supabase
       .from('annotations_maladie')
       .insert([{
@@ -318,11 +305,9 @@ const MesImages = () => {
         annotated_image_url: publicUrl,
         annotation_details: annotationPayload,
       }]);
-
     if (annotationInsertError) throw annotationInsertError;
   };
 
-  // Soumission directe SANS mot de passe (mode ajout d'avis) — multi-maladies
   const handleAddAvis = async () => {
     setError('');
     const keys = Object.keys(multiSelections);
@@ -336,7 +321,6 @@ const MesImages = () => {
       const maladieNom  = keys.join(' + ');
       const stadeNom    = keys.map(k => multiSelections[k].stage || 'Standard').join(' / ');
       const insertedDiagnosticIds = [];
-      
       const baseData = {
         image_hash:          selectedGroup.image_hash,
         image_url:           selectedGroup.image_url,
@@ -346,22 +330,12 @@ const MesImages = () => {
         nom_image_renommee:  selectedGroup.avis[0]?.nom_image_renommee  || '',
         date_diagnostique:   today,
       };
-      
-      // Liste des médecins à insérer
-      const medecins = [
-        { id: currentUserId, nom: doctorDisplayName }
-      ];
+      const medecins = [{ id: currentUserId, nom: doctorDisplayName }];
       if (sessionMode === 'collaboration' && collaborator) {
-        medecins.push({ 
-          id: collaborator.id, 
-          nom: `${collaborator.prenom} ${collaborator.nom}`.trim() 
-        });
+        medecins.push({ id: collaborator.id, nom: `${collaborator.prenom} ${collaborator.nom}`.trim() });
       }
-
-      // Insérer pour chaque médecin (RPC en mode collaboration)
       for (const medecin of medecins) {
         if (sessionMode === 'collaboration') {
-          // Utiliser RPC pour contourner RLS
           const { error } = await supabase.rpc('insert_diagnostic_collaboration', {
             p_image_hash:         baseData.image_hash,
             p_image_url:          baseData.image_url,
@@ -375,13 +349,11 @@ const MesImages = () => {
             p_date_diagnostique:   baseData.date_diagnostique
           });
           if (error) throw error;
-
           if (medecin.id === currentUserId) {
             const latestId = await getLatestDiagnosticIdForUser(baseData.image_hash, currentUserId);
             if (latestId) insertedDiagnosticIds.push(latestId);
           }
         } else {
-          // Mode solo : insertion normale
           const { data, error } = await supabase.from('categories_diagnostics').insert([{
             ...baseData,
             utilisateur_id: medecin.id,
@@ -391,13 +363,8 @@ const MesImages = () => {
           if (medecin.id === currentUserId && data?.id) insertedDiagnosticIds.push(data.id);
         }
       }
-
       const targetDiagnosticId = insertedDiagnosticIds[0] || await getLatestDiagnosticIdForUser(baseData.image_hash, currentUserId);
-      await saveAnnotationRecord({
-        diagnosticId: targetDiagnosticId,
-        imageHash: baseData.image_hash,
-      });
-      
+      await saveAnnotationRecord({ diagnosticId: targetDiagnosticId, imageHash: baseData.image_hash });
       setShowModal(false);
       setMultiSelections({});
       setAnnotationPayload(null);
@@ -410,7 +377,6 @@ const MesImages = () => {
     }
   };
 
-  // Confirmation AVEC mot de passe (mode modification uniquement)
   const handleConfirmAction = async () => {
     setError('');
     const isValid = await verifyPassword(password.trim());
@@ -451,11 +417,42 @@ const MesImages = () => {
         <header className="flex justify-between items-center mb-8">
           <div className="flex items-center gap-4">
             <ImageIcon className="text-cyan-400" size={30} />
-            <h1 className="text-2xl font-bold uppercase tracking-widest italic">DIAGNOSTICS</h1>
+            <div>
+              <h1 className="text-2xl font-bold uppercase tracking-widest italic">DIAGNOSTICS</h1>
+              {/* ── Compteur principal sous le titre ── */}
+              <p className="text-[11px] text-slate-400 mt-0.5">
+                <span className="text-cyan-400 font-black">{myDiagnosticsCount}</span>
+                {' '}image{myDiagnosticsCount !== 1 ? 's' : ''} diagnostiquée{myDiagnosticsCount !== 1 ? 's' : ''}
+                {(searchTerm || searchDoctor) && activeTab === 'mes-diagnostics' && (
+                  <span className="text-slate-500">
+                    {' '}·{' '}
+                    <span className="text-white font-bold">{filteredCount}</span> affichée{filteredCount !== 1 ? 's' : ''}
+                  </span>
+                )}
+              </p>
+            </div>
           </div>
+
+          {/* Onglets avec badges compteurs */}
           <div className="flex bg-slate-800 p-1 rounded-2xl border border-white/5 shadow-2xl">
-            <button onClick={() => setActiveTab('mes-diagnostics')} className={`px-6 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'mes-diagnostics' ? 'bg-cyan-500 text-white' : 'text-slate-500'}`}>MES DIAGNOSTICS</button>
-            <button onClick={() => setActiveTab('disponibles')}    className={`px-6 py-2 rounded-xl text-xs font-bold transition-all ${activeTab === 'disponibles'    ? 'bg-cyan-500 text-white' : 'text-slate-500'}`}>CONTRIBUER</button>
+            <button
+              onClick={() => setActiveTab('mes-diagnostics')}
+              className={`px-5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${activeTab === 'mes-diagnostics' ? 'bg-cyan-500 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+            >
+              MES DIAGNOSTICS
+              <span className={`min-w-[20px] px-1.5 py-0.5 rounded-full text-[9px] font-black text-center ${activeTab === 'mes-diagnostics' ? 'bg-white/25 text-white' : 'bg-slate-700 text-slate-400'}`}>
+                {myDiagnosticsCount}
+              </span>
+            </button>
+            <button
+              onClick={() => setActiveTab('disponibles')}
+              className={`px-5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${activeTab === 'disponibles' ? 'bg-cyan-500 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+            >
+              CONTRIBUER
+              <span className={`min-w-[20px] px-1.5 py-0.5 rounded-full text-[9px] font-black text-center ${activeTab === 'disponibles' ? 'bg-white/25 text-white' : 'bg-slate-700 text-slate-400'}`}>
+                {availableGroups.length}
+              </span>
+            </button>
           </div>
         </header>
 
@@ -482,7 +479,7 @@ const MesImages = () => {
         </div>
 
         {/* Filtres */}
-        <div className="flex flex-col md:flex-row gap-4 mb-8">
+        <div className="flex flex-col md:flex-row gap-4 mb-4">
           <div className="flex-1">
             <label className="text-[10px] font-black text-slate-500 uppercase ml-2 mb-1 block">Filtrer par Maladie</label>
             <select className="w-full bg-slate-800 border border-white/5 p-4 rounded-2xl text-xs font-bold outline-none" value={searchTerm} onChange={e => setSearchTerm(e.target.value)}>
@@ -499,9 +496,41 @@ const MesImages = () => {
           </div>
         </div>
 
+        {/* ── Bande récap entre filtres et grille ── */}
+        <div className="flex items-center justify-between mb-6 px-1">
+          <p className="text-[11px] text-slate-500 uppercase font-bold tracking-wide">
+            {activeTab === 'mes-diagnostics'
+              ? <>
+                  <span className="text-white">{filteredCount}</span>
+                  {` image${filteredCount !== 1 ? 's' : ''} affichée${filteredCount !== 1 ? 's' : ''}`}
+                  {(searchTerm || searchDoctor) ? ` sur ${myDiagnosticsCount} au total` : ''}
+                </>
+              : <>
+                  <span className="text-white">{filteredCount}</span>
+                  {` image${filteredCount !== 1 ? 's' : ''} disponible${filteredCount !== 1 ? 's' : ''} à diagnostiquer`}
+                </>
+            }
+          </p>
+          {(searchTerm || searchDoctor) && (
+            <button
+              onClick={() => { setSearchTerm(''); setSearchDoctor(''); }}
+              className="text-[10px] text-cyan-400 hover:text-cyan-300 font-bold uppercase underline underline-offset-2 transition-colors"
+            >
+              Réinitialiser les filtres
+            </button>
+          )}
+        </div>
+
         {/* Grille */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-          {filteredData.map(group => {
+          {filteredData.length === 0 ? (
+            <div className="col-span-3 flex flex-col items-center justify-center py-20 gap-3 text-slate-600">
+              <ImageIcon size={48} />
+              <p className="text-sm font-bold uppercase">
+                {activeTab === 'mes-diagnostics' ? 'Aucun diagnostic trouvé' : 'Aucune image disponible'}
+              </p>
+            </div>
+          ) : filteredData.map(group => {
             const status = getAvisStatus(group);
             return (
               <div key={group.image_hash} className={`relative bg-slate-800 rounded-[2.5rem] overflow-hidden border transition-all ${status === 'validated' ? 'border-purple-500/50' : status === 'divergent' ? 'border-red-500/40' : 'border-white/5'}`}>
@@ -513,7 +542,6 @@ const MesImages = () => {
                   </div>
                 </div>
                 <div className="p-6 space-y-3">
-                  {/* Afficher les avis SEULEMENT dans "Mes diagnostics" */}
                   {activeTab === 'mes-diagnostics' && group.avis.map(avi => (
                     <div key={avi.id} className={`p-4 rounded-2xl border ${avi.utilisateur_id === currentUserId ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-slate-900 border-transparent'}`}>
                       <div className="flex justify-between items-start">
@@ -531,7 +559,6 @@ const MesImages = () => {
                     </div>
                   ))}
                   
-                  {/* Message informatif dans "Contribuer" */}
                   {activeTab === 'disponibles' && (
                     <>
                       <div className="p-4 rounded-2xl bg-slate-900 border border-slate-700">
@@ -570,11 +597,8 @@ const MesImages = () => {
       {/* ─── MODALE AJOUT / ÉDITION ─── */}
       {showModal && (
         <div className="fixed inset-0 bg-black/90 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-
-          {/* Largeur adaptative : large si ajout d'avis (image visible) sinon compact */}
           <div className={`bg-slate-800 border border-white/10 shadow-2xl rounded-[2.5rem] w-full overflow-hidden flex ${modalMode === 'add' && step === 1 ? 'max-w-3xl flex-row' : 'max-w-sm flex-col p-8'}`}>
 
-            {/* ── IMAGE (gauche) — uniquement mode ajout étape 1 ── */}
             {modalMode === 'add' && step === 1 && selectedGroup && (
               <div className="w-1/2 shrink-0 relative bg-slate-900 min-h-[440px] flex items-center justify-center p-4">
                 <ImageDisplay
@@ -582,15 +606,12 @@ const MesImages = () => {
                   alt="Image à diagnostiquer"
                   className="w-full h-full object-contain"
                 />
-                {/* Overlay bas : nom du fichier uniquement */}
                 <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent p-5">
                   <p className="text-[9px] text-cyan-400 uppercase font-bold tracking-widest mb-1">Image à diagnostiquer</p>
                   <p className="text-xs text-white font-bold truncate">
                     {selectedGroup.avis[0]?.nom_image_originale || 'Image'}
                   </p>
                 </div>
-
-                {/* Badge info cliquable en haut à droite */}
                 {selectedGroup.avis.length > 0 && (
                   <div className="absolute top-4 right-4">
                     <button
@@ -603,8 +624,6 @@ const MesImages = () => {
                       </svg>
                       <span className="text-[10px] font-bold text-white">{selectedGroup.avis.length} avis</span>
                     </button>
-
-                    {/* Bulle d'information au survol */}
                     {showAvisInfo && (
                       <div className="absolute top-full right-0 mt-2 w-72 bg-slate-800/95 backdrop-blur-md border border-cyan-500/30 rounded-2xl p-4 shadow-2xl z-50">
                         <p className="text-[9px] text-cyan-400 uppercase font-bold mb-2 tracking-wider">👁️ Avis existants (optionnel)</p>
@@ -631,7 +650,6 @@ const MesImages = () => {
               </div>
             )}
 
-            {/* ── FORMULAIRE (droite ou seul si edit) ── */}
             <div className={`flex flex-col justify-center ${modalMode === 'add' && step === 1 ? 'w-1/2 p-8' : 'w-full'}`}>
               <h2 className="text-xl font-black mb-8 text-center uppercase tracking-tighter">
                 {step === 1 ? (modalMode === 'edit' ? 'Modifier le diagnostic' : 'Donner mon avis') : 'Confirmation'}
@@ -639,7 +657,6 @@ const MesImages = () => {
 
               {step === 1 ? (
                 <div className="space-y-5">
-                  {/* Alerte info pour modification */}
                   {modalMode === 'edit' && (
                     <div className="flex items-start gap-3 p-4 bg-blue-500/10 border border-blue-500/30 rounded-2xl">
                       <Info size={20} className="text-blue-400 shrink-0 mt-0.5" />
@@ -650,7 +667,6 @@ const MesImages = () => {
                     </div>
                   )}
 
-                  {/* ── Mode AJOUT : checkboxes multi-sélection ── */}
                   {modalMode === 'add' ? (
                     <div className="space-y-4">
                       <div className="flex items-center justify-between gap-3 p-3 rounded-2xl border border-cyan-500/30 bg-cyan-500/10">
@@ -665,13 +681,11 @@ const MesImages = () => {
                           {annotationPayload ? 'Modifier contour' : 'Tracer contour'}
                         </button>
                       </div>
-
                       {annotationPreviewUrl && (
                         <div className="rounded-2xl border border-white/10 overflow-hidden">
                           <img src={annotationPreviewUrl} alt="Aperçu annotation" className="w-full h-32 object-cover" />
                         </div>
                       )}
-
                       <div className="space-y-2 overflow-y-auto max-h-[260px] pr-1 custom-scrollbar">
                         {categoryOptions.map(cat => {
                           const isChecked = !!multiSelections[cat.name];
@@ -696,7 +710,6 @@ const MesImages = () => {
                                   }}
                                 />
                               </div>
-                              {/* Stade déroulant si coché et options disponibles */}
                               {isChecked && cat.options.length > 0 && (
                                 <div className="px-3 pb-3">
                                   <select
@@ -715,7 +728,6 @@ const MesImages = () => {
                       </div>
                     </div>
                   ) : (
-                    /* ── Mode EDIT : menus déroulants simples ── */
                     <>
                       <div className="space-y-2">
                         <label className="text-[10px] font-black text-slate-500 uppercase ml-2">Pathologie</label>
@@ -764,8 +776,8 @@ const MesImages = () => {
                   />
                   {error && <p className="text-red-400 text-center text-[10px] font-bold uppercase">{error}</p>}
                   <div className="flex gap-4">
-                    <button onClick={() => setStep(1)}          className="flex-1 py-5 bg-slate-700 rounded-2xl font-black uppercase text-xs hover:bg-slate-600">Retour</button>
-                    <button onClick={handleConfirmAction}       className="flex-1 py-5 bg-cyan-600 rounded-2xl font-black uppercase text-xs hover:bg-cyan-500">Valider</button>
+                    <button onClick={() => setStep(1)}    className="flex-1 py-5 bg-slate-700 rounded-2xl font-black uppercase text-xs hover:bg-slate-600">Retour</button>
+                    <button onClick={handleConfirmAction} className="flex-1 py-5 bg-cyan-600 rounded-2xl font-black uppercase text-xs hover:bg-cyan-500">Valider</button>
                   </div>
                 </div>
               )}
