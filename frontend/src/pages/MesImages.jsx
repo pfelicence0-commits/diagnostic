@@ -170,9 +170,52 @@ const MesImages = () => {
   const myGroups        = allDataGrouped.filter(g => g.avis.some(a => a.utilisateur_id === currentUserId));
   const availableGroups = allDataGrouped.filter(g => !g.avis.some(a => a.utilisateur_id === currentUserId) && getAvisStatus(g) !== 'validated');
 
+  // ── Parsing multi-maladies ────────────────────────────────────────────────
+  // Gère : "PDR + ATEL + CHOLE (STADE III / POST-SUP)", "OMA + Perfo", etc.
+  const MALADIES_COMPOSEES_FILTRE = [
+    'PDR + ATEL + CHOLE', 'PDR + Atel + Chole',   // triple → tester en premier
+    'PDR + ATEL', 'PDR + Atel',                    // double
+  ];
+
+  const parseMaladiesFiltre = (maladieNom) => {
+    if (!maladieNom) return [];
+    // Retirer les stades entre parenthèses ex: "(STADE III / POST-SUP)"
+    const nom = maladieNom.trim().replace(/\([^)]*\)/g, '').trim();
+    // Tester les composées connues (plus longues en premier)
+    for (const composee of MALADIES_COMPOSEES_FILTRE) {
+      if (nom.toLowerCase().includes(composee.toLowerCase())) {
+        const partiesComposee = new Set(
+          composee.toLowerCase().split('+').map(p => p.trim())
+        );
+        const extras = nom
+          .replace(new RegExp(composee.replace(/\+/g, '\\+'), 'i'), '')
+          .split('+')
+          .map(p => p.trim())
+          .filter(p => p.length > 0 && !partiesComposee.has(p.toLowerCase()));
+        return [composee, ...extras];
+      }
+    }
+    // Pas de composée → split simple sur '+'
+    return nom.split('+').map(p => p.trim()).filter(Boolean);
+  };
+
+  const imageAppartientAClasse = (maladieNom, classeFiltre) => {
+    if (!maladieNom || !classeFiltre) return false;
+    const normaliser = (s) =>
+      s.trim().toLowerCase()
+       .replace(/ \+ /g, '_').replace(/\+/g, '_')
+       .replace(/ /g, '_');
+    const filtreNorm = normaliser(classeFiltre);
+    return parseMaladiesFiltre(maladieNom).some(m => {
+      const mNorm = normaliser(m);
+      return mNorm === filtreNorm || mNorm.includes(filtreNorm) || filtreNorm.includes(mNorm);
+    });
+  };
+  // ─────────────────────────────────────────────────────────────────────────
+
   const filteredData = (activeTab === 'mes-diagnostics' ? myGroups : availableGroups).filter(group =>
     group.avis.some(avi => {
-      const diseaseMatch = searchTerm  === '' || avi.maladie_nom === searchTerm;
+      const diseaseMatch = searchTerm   === '' || imageAppartientAClasse(avi.maladie_nom, searchTerm);
       const doctorMatch  = searchDoctor === '' || avi.nom_medecin_diagnostiqueur === searchDoctor;
       return diseaseMatch && doctorMatch;
     })
