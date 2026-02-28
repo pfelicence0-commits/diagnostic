@@ -94,7 +94,6 @@ export default function Accueil() {
     return URL.createObjectURL(file);
   };
 
-  // ── Calcul SHA-256 d'un fichier ──────────────────────────
   const calculateHash = async (file) => {
     const buffer = await file.arrayBuffer();
     const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
@@ -102,33 +101,22 @@ export default function Accueil() {
       .map(b => b.toString(16).padStart(2, '0')).join('');
   };
 
-  // ── Vérification par lots de 100 (limite Supabase .in()) ──
-  // Traite les 499+ hash en plusieurs requêtes pour éviter la troncature silencieuse
   const checkHashesBatch = async (hashes) => {
     if (!hashes.length) return new Set();
-
-    const SUPABASE_BATCH = 100; // limite sécurisée pour .in()
+    const SUPABASE_BATCH = 100;
     const allFound = new Set();
-
     for (let i = 0; i < hashes.length; i += SUPABASE_BATCH) {
       const lot = hashes.slice(i, i + SUPABASE_BATCH);
       const { data, error } = await supabase
         .from('categories_diagnostics')
         .select('image_hash')
         .in('image_hash', lot);
-
-      if (error) {
-        console.error(`Erreur Supabase lot ${i}–${i + SUPABASE_BATCH}:`, error);
-        continue; // on continue les autres lots même si un échoue
-      }
-
+      if (error) { console.error(`Erreur Supabase lot ${i}:`, error); continue; }
       (data || []).forEach(r => allFound.add(r.image_hash));
     }
-
     return allFound;
   };
 
-  // Vérifie si l'image courante existe déjà dans Supabase (par hash)
   const checkCurrentImageExists = async (file) => {
     setIsCurrentImageChecking(true);
     try {
@@ -147,9 +135,6 @@ export default function Accueil() {
     }
   };
 
-  // ════════════════════════════════════════════════════════
-  // Import du dossier avec vérification complète par lots
-  // ════════════════════════════════════════════════════════
   const handleFolderChange = async (e) => {
     const files = Array.from(e.target.files);
     const allowedExtensions = ['jpg', 'jpeg', 'png', 'tif', 'tiff', 'webp', 'bmp'];
@@ -157,88 +142,45 @@ export default function Accueil() {
       const ext = file.name.split('.').pop().toLowerCase();
       return allowedExtensions.includes(ext) || file.type.startsWith('image/');
     });
-
     if (imageFiles.length === 0) return;
 
-    // ── Étape 1 : générer les previews ──────────────────────
     setIsLoading(true);
     const queue = [];
     for (let i = 0; i < imageFiles.length; i++) {
       try {
         const preview = await processFileToPreview(imageFiles[i]);
-        queue.push({
-          id:      i,
-          file:    imageFiles[i],
-          preview,
-          status:  'pending',
-          name:    imageFiles[i].name,
-          hash:    null,
-        });
-      } catch (err) {
-        console.error("Erreur lecture:", imageFiles[i].name);
-      }
+        queue.push({ id: i, file: imageFiles[i], preview, status: 'pending', name: imageFiles[i].name, hash: null });
+      } catch (err) { console.error("Erreur lecture:", imageFiles[i].name); }
     }
     setIsLoading(false);
 
-    // Afficher la galerie immédiatement (sans attendre la vérif)
     setFileQueue(queue);
     setCurrentIndex(0);
     setSelectedFile(queue[0].file);
     setSelectedImage(queue[0].preview);
     resetAnnotationState();
     setSaveMessage('');
+    setImportStats({ total: queue.length, existing: 0, pending: queue.length, progress: 0 });
 
-    // Initialiser les stats avec progression à 0
-    setImportStats({
-      total:    queue.length,
-      existing: 0,
-      pending:  queue.length,
-      progress: 0,  // progression du calcul des hash
-    });
-
-    // ── Étape 2 : calculer les hash par lots de 20 ──────────
     setIsChecking(true);
     try {
-      const HASH_BATCH = 20; // taille des lots pour le calcul JS (mémoire)
+      const HASH_BATCH = 20;
       const withHash = [...queue];
-
       for (let i = 0; i < withHash.length; i += HASH_BATCH) {
         const lot = withHash.slice(i, i + HASH_BATCH);
-        await Promise.all(lot.map(async (item) => {
-          item.hash = await calculateHash(item.file);
-        }));
-
-        // Mise à jour de la progression en temps réel
-        setImportStats(prev => prev ? {
-          ...prev,
-          progress: Math.min(i + HASH_BATCH, withHash.length),
-        } : null);
+        await Promise.all(lot.map(async (item) => { item.hash = await calculateHash(item.file); }));
+        setImportStats(prev => prev ? { ...prev, progress: Math.min(i + HASH_BATCH, withHash.length) } : null);
       }
-
-      // ── Étape 3 : vérification Supabase par lots de 100 ───
-      // Filtre les nulls au cas où un fichier aurait échoué
       const allHashes = withHash.map(item => item.hash).filter(Boolean);
-
-      // checkHashesBatch envoie max 100 hash par requête → gère 499+ images sans problème
       const existingSet = await checkHashesBatch(allHashes);
-
-      // ── Étape 4 : marquer les doublons ────────────────────
       let nbExisting = 0;
       const checkedQueue = withHash.map(item => {
         const exists = item.hash && existingSet.has(item.hash);
         if (exists) nbExisting++;
         return { ...item, status: exists ? 'uploaded' : 'pending' };
       });
-
       setFileQueue(checkedQueue);
-      setImportStats({
-        total:    checkedQueue.length,
-        existing: nbExisting,
-        pending:  checkedQueue.length - nbExisting,
-        progress: checkedQueue.length, // 100% terminé
-      });
-
-      // Sélectionner automatiquement la 1ère image NON encore traitée
+      setImportStats({ total: checkedQueue.length, existing: nbExisting, pending: checkedQueue.length - nbExisting, progress: checkedQueue.length });
       const firstPending = checkedQueue.findIndex(item => item.status === 'pending');
       if (firstPending !== -1) {
         setCurrentIndex(firstPending);
@@ -247,7 +189,6 @@ export default function Accueil() {
       } else {
         setSaveMessage('✅ Toutes les images ont déjà été traitées !');
       }
-
     } catch (err) {
       console.error("Erreur vérification Supabase:", err);
     } finally {
@@ -351,9 +292,7 @@ export default function Accueil() {
   };
 
   const goToNext = (currentQueue, currentIdx) => {
-    const nextPending = currentQueue.findIndex(
-      (item, i) => i > currentIdx && item.status === 'pending'
-    );
+    const nextPending = currentQueue.findIndex((item, i) => i > currentIdx && item.status === 'pending');
     if (nextPending !== -1) {
       setCurrentIndex(nextPending);
       setSelectedFile(currentQueue[nextPending].file);
@@ -371,19 +310,12 @@ export default function Accueil() {
   const buildRenamedFileName = async (selectedDiseases, selectionsData, docId, fileExt) => {
     const diseaseParts = selectedDiseases.map(diseaseName => {
       const stage = selectionsData[diseaseName]?.stage || 'Aucun';
-      if (diseaseName === 'Autre' && autreDescription.trim()) {
-        return `Autre_${autreDescription.trim().replace(/\s+/g, '-')}`;
-      }
+      if (diseaseName === 'Autre' && autreDescription.trim()) return `Autre_${autreDescription.trim().replace(/\s+/g, '-')}`;
       if (stage === 'Aucun') return diseaseName;
       return `${diseaseName}_${stage.replace(/\s+/g, '-')}`;
     }).join('_');
-
     const maladieLabel = selectedDiseases.join(' + ');
-    const { count, error } = await supabase
-      .from('categories_diagnostics')
-      .select('*', { count: 'exact', head: true })
-      .eq('maladie_nom', maladieLabel);
-
+    const { count, error } = await supabase.from('categories_diagnostics').select('*', { count: 'exact', head: true }).eq('maladie_nom', maladieLabel);
     if (error) console.warn('Erreur comptage:', error.message);
     const compteur = (count || 0) + 1;
     const nom = `${compteur}_${diseaseParts}_${docId}.${fileExt}`;
@@ -392,20 +324,10 @@ export default function Accueil() {
 
   const handleUpload = async () => {
     const selectedDiseases = Object.keys(selections);
-
-    if (!selectedFile || selectedDiseases.length === 0) {
-      setSaveMessage("⚠️ Sélectionnez au moins une maladie");
-      return;
-    }
-    if (selectedDiseases.includes('Autre') && !autreDescription.trim()) {
-      setSaveMessage("⚠️ Précisez la pathologie dans le champ « Autre »");
-      return;
-    }
+    if (!selectedFile || selectedDiseases.length === 0) { setSaveMessage("⚠️ Sélectionnez au moins une maladie"); return; }
+    if (selectedDiseases.includes('Autre') && !autreDescription.trim()) { setSaveMessage("⚠️ Précisez la pathologie dans le champ « Autre »"); return; }
     for (const disease of selectedDiseases) {
-      if (!annotations[disease]) {
-        setSaveMessage(`⚠️ Dessinez le contour pour ${disease}`);
-        return;
-      }
+      if (!annotations[disease]) { setSaveMessage(`⚠️ Dessinez le contour pour ${disease}`); return; }
     }
 
     setIsSaving(true);
@@ -420,25 +342,12 @@ export default function Accueil() {
         return;
       }
 
-      // Vérification finale anti-doublon juste avant l'upload
-      const { data: existCheck } = await supabase
-        .from('categories_diagnostics')
-        .select('image_hash, maladie_nom, nom_medecin_diagnostiqueur')
-        .eq('image_hash', imageHash)
-        .limit(1);
-
+      const { data: existCheck } = await supabase.from('categories_diagnostics').select('image_hash, maladie_nom, nom_medecin_diagnostiqueur').eq('image_hash', imageHash).limit(1);
       if (existCheck && existCheck.length > 0) {
         const info = existCheck[0];
-        // Marquer dans la queue
-        const updatedQueue = fileQueue.map((item, i) =>
-          i === currentIndex ? { ...item, status: 'uploaded', hash: imageHash } : item
-        );
+        const updatedQueue = fileQueue.map((item, i) => i === currentIndex ? { ...item, status: 'uploaded', hash: imageHash } : item);
         setFileQueue(updatedQueue);
-        setImportStats(prev => prev ? {
-          ...prev,
-          existing: prev.existing + 1,
-          pending:  Math.max(0, prev.pending - 1),
-        } : null);
+        setImportStats(prev => prev ? { ...prev, existing: prev.existing + 1, pending: Math.max(0, prev.pending - 1) } : null);
         setSaveMessage(`⚠️ Image déjà enregistrée (par ${info.nom_medecin_diagnostiqueur || 'un médecin'} — ${info.maladie_nom || ''}) — passage à la suivante...`);
         setTimeout(() => goToNext(updatedQueue, currentIndex), 2000);
         setIsSaving(false);
@@ -446,32 +355,24 @@ export default function Accueil() {
       }
 
       const fileExt = selectedFile.name.split('.').pop();
-      const doctors = sessionMode === 'collaboration' && collaborator
-        ? [currentUser, collaborator]
-        : [currentUser];
+      const doctors = sessionMode === 'collaboration' && collaborator ? [currentUser, collaborator] : [currentUser];
 
       let combinedAnnotBlob = null;
       if (annotationPreviewUrl) {
         combinedAnnotBlob = await (await fetch(annotationPreviewUrl)).blob();
       }
 
-      const maladieLabel = selectedDiseases.map(d =>
-        d === 'Autre' && autreDescription.trim()
-          ? `Autre (${autreDescription.trim()})`
-          : d
-      ).join(' + ');
-      const stadeLabel = selectedDiseases.map(d => selections[d]?.stage || 'Aucun').join(' / ');
+      const maladieLabel = selectedDiseases.map(d => d === 'Autre' && autreDescription.trim() ? `Autre (${autreDescription.trim()})` : d).join(' + ');
+      const stadeLabel   = selectedDiseases.map(d => selections[d]?.stage || 'Aucun').join(' / ');
 
       for (const doc of doctors) {
         const nomRenomme  = await buildRenamedFileName(selectedDiseases, selections, doc.id, fileExt);
         const storagePath = `diagnostics/${nomRenomme}`;
 
-        const { error: uploadErr } = await supabase.storage
-          .from('images').upload(storagePath, selectedFile);
+        const { error: uploadErr } = await supabase.storage.from('images').upload(storagePath, selectedFile);
         if (uploadErr) throw uploadErr;
 
-        const { data: { publicUrl } } = supabase.storage
-          .from('images').getPublicUrl(storagePath);
+        const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(storagePath);
 
         const stadeInsert = selectedDiseases.includes('Autre') && autreDescription.trim()
           ? stadeLabel.replace('Aucun', autreDescription.trim())
@@ -496,14 +397,27 @@ export default function Accueil() {
 
         if (doc.id === currentUser.id && combinedAnnotBlob) {
           const annotPath = `annotations/${imageHash}_${doc.id}_combined.png`;
-          const { error: uploadAnnotErr } = await supabase.storage
-            .from('images').upload(annotPath, combinedAnnotBlob);
+          const { error: uploadAnnotErr } = await supabase.storage.from('images').upload(annotPath, combinedAnnotBlob);
 
           if (!uploadAnnotErr) {
-            const { data: { publicUrl: annotPublicUrl } } = supabase.storage
-              .from('images').getPublicUrl(annotPath);
+            const { data: { publicUrl: annotPublicUrl } } = supabase.storage.from('images').getPublicUrl(annotPath);
 
-            for (const diseaseName of selectedDiseases) {
+            // ── Nouveau format : une seule ligne avec TOUS les contours ──────────
+            const contours = selectedDiseases
+              .filter(d => annotations[d]?.points_normalized?.length >= 3)
+              .map(d => {
+                const disease = categoryOptions.find(c => c.name === d);
+                return {
+                  maladie:           d,
+                  color:             disease?.color || '#22d3ee',
+                  points_normalized: annotations[d].points_normalized,
+                  points_pixels:     annotations[d].points_pixels,
+                  bounding_box:      annotations[d].bounding_box,
+                  created_at:        new Date().toISOString(),
+                };
+              });
+
+            if (contours.length > 0) {
               await supabase.from('annotations_maladie').insert([{
                 diagnostic_id:        diagData.id,
                 image_hash:           imageHash,
@@ -511,24 +425,16 @@ export default function Accueil() {
                 image_original_url:   publicUrl,
                 annotated_image_path: annotPath,
                 annotated_image_url:  annotPublicUrl,
-                annotation_details:   annotations[diseaseName],
+                annotation_details:   { contours },
               }]);
             }
           }
         }
       }
 
-      const updatedQueue = fileQueue.map((item, i) =>
-        i === currentIndex ? { ...item, status: 'uploaded', hash: imageHash } : item
-      );
+      const updatedQueue = fileQueue.map((item, i) => i === currentIndex ? { ...item, status: 'uploaded', hash: imageHash } : item);
       setFileQueue(updatedQueue);
-
-      setImportStats(prev => prev ? {
-        ...prev,
-        existing: prev.existing + 1,
-        pending:  Math.max(0, prev.pending - 1),
-      } : null);
-
+      setImportStats(prev => prev ? { ...prev, existing: prev.existing + 1, pending: Math.max(0, prev.pending - 1) } : null);
       setSaveMessage(`✅ Enregistré !`);
       setTimeout(() => goToNext(updatedQueue, currentIndex), 1200);
 
@@ -550,26 +456,17 @@ export default function Accueil() {
 
         {/* ── GALERIE ── */}
         <div className="w-48 flex-shrink-0 flex flex-col bg-slate-800/50 rounded-3xl border border-white/10 overflow-hidden">
-
-          {/* En-tête */}
           <div className="flex items-center gap-2 px-4 py-3 border-b border-white/10 flex-shrink-0">
             <ImageIcon size={15} className="text-cyan-400 flex-shrink-0" />
-            <h2 className="text-[10px] font-bold uppercase tracking-widest truncate flex-1">
-              Galerie ({fileQueue.length})
-            </h2>
+            <h2 className="text-[10px] font-bold uppercase tracking-widest truncate flex-1">Galerie ({fileQueue.length})</h2>
             {fileQueue.length > 0 && (
-              <button
-                onClick={handleClearQueue}
-                disabled={isSaving}
-                title="Vider la galerie"
-                className="w-5 h-5 flex-shrink-0 flex items-center justify-center rounded-full bg-slate-600 hover:bg-red-500 transition-colors disabled:opacity-40"
-              >
+              <button onClick={handleClearQueue} disabled={isSaving} title="Vider la galerie"
+                className="w-5 h-5 flex-shrink-0 flex items-center justify-center rounded-full bg-slate-600 hover:bg-red-500 transition-colors disabled:opacity-40">
                 <X size={11} className="text-white" />
               </button>
             )}
           </div>
 
-          {/* ── Bandeau stats après import ── */}
           {importStats && (
             <div className="px-3 py-2 border-b border-white/10 flex-shrink-0 space-y-1">
               {isChecking ? (
@@ -578,18 +475,13 @@ export default function Accueil() {
                     <Activity size={11} className="animate-spin text-cyan-400" />
                     <span className="text-[9px] text-cyan-400">Vérification...</span>
                   </div>
-                  {/* Barre de progression du calcul des hash */}
                   <div className="flex justify-between items-center">
                     <span className="text-[9px] text-slate-500">Hash calculés</span>
-                    <span className="text-[9px] text-slate-400">
-                      {importStats.progress || 0} / {importStats.total}
-                    </span>
+                    <span className="text-[9px] text-slate-400">{importStats.progress || 0} / {importStats.total}</span>
                   </div>
                   <div className="w-full bg-slate-700 rounded-full h-1">
-                    <div
-                      className="bg-cyan-400 h-1 rounded-full transition-all duration-300"
-                      style={{ width: `${((importStats.progress || 0) / importStats.total) * 100}%` }}
-                    />
+                    <div className="bg-cyan-400 h-1 rounded-full transition-all duration-300"
+                      style={{ width: `${((importStats.progress || 0) / importStats.total) * 100}%` }} />
                   </div>
                 </div>
               ) : (
@@ -599,28 +491,22 @@ export default function Accueil() {
                     <span className="text-[9px] font-bold text-white">{importStats.total}</span>
                   </div>
                   <div className="flex justify-between items-center">
-                    <span className="text-[9px] text-green-400 flex items-center gap-1">
-                      <CheckCircle2 size={9} /> Déjà faites
-                    </span>
+                    <span className="text-[9px] text-green-400 flex items-center gap-1"><CheckCircle2 size={9} /> Déjà faites</span>
                     <span className="text-[9px] font-bold text-green-400">{importStats.existing}</span>
                   </div>
                   <div className="flex justify-between items-center">
                     <span className="text-[9px] text-cyan-400">À traiter</span>
                     <span className="text-[9px] font-bold text-cyan-400">{importStats.pending}</span>
                   </div>
-                  {/* Barre de progression globale */}
                   <div className="w-full bg-slate-700 rounded-full h-1 mt-1">
-                    <div
-                      className="bg-green-400 h-1 rounded-full transition-all"
-                      style={{ width: `${importStats.total > 0 ? (importStats.existing / importStats.total) * 100 : 0}%` }}
-                    />
+                    <div className="bg-green-400 h-1 rounded-full transition-all"
+                      style={{ width: `${importStats.total > 0 ? (importStats.existing / importStats.total) * 100 : 0}%` }} />
                   </div>
                 </>
               )}
             </div>
           )}
 
-          {/* Indicateur de vérification en cours (avant que importStats soit défini) */}
           {isChecking && !importStats && (
             <div className="px-3 py-2 border-b border-white/10 flex-shrink-0 flex items-center gap-2">
               <Activity size={11} className="animate-spin text-cyan-400" />
@@ -628,7 +514,6 @@ export default function Accueil() {
             </div>
           )}
 
-          {/* Liste images */}
           <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar min-h-0">
             {isLoading ? (
               <div className="flex flex-col items-center justify-center py-10 gap-2">
@@ -640,70 +525,50 @@ export default function Accueil() {
                 <ImageIcon size={28} />
                 <p className="text-[9px] uppercase font-bold text-center">Aucune image</p>
               </div>
-            ) : (
-              fileQueue.map((item, idx) => (
-                <div
-                  key={idx}
-                  onClick={async () => {
-                    if (!isSaving) {
-                      setCurrentIndex(idx);
-                      setSelectedFile(item.file);
-                      setSelectedImage(item.preview);
-                      resetAnnotationState();
-                      setSelections({});
-                      setAutreDescription('');
-                      setSaveMessage('');
-                      // Vérifier si cette image existe déjà dans Supabase (si pas encore fait)
-                      if (item.status !== 'uploaded') {
-                        const { exists, hash, info } = await checkCurrentImageExists(item.file);
-                        if (exists) {
-                          setFileQueue(prev => prev.map((q, i) =>
-                            i === idx ? { ...q, status: 'uploaded', hash } : q
-                          ));
-                          setSaveMessage(`⚠️ Image déjà enregistrée (diagnostiquée par ${info?.nom_medecin_diagnostiqueur || 'un médecin'} — ${info?.maladie_nom || ''})`);
-                        } else if (hash) {
-                          setFileQueue(prev => prev.map((q, i) =>
-                            i === idx ? { ...q, hash } : q
-                          ));
-                        }
+            ) : fileQueue.map((item, idx) => (
+              <div key={idx}
+                onClick={async () => {
+                  if (!isSaving) {
+                    setCurrentIndex(idx);
+                    setSelectedFile(item.file);
+                    setSelectedImage(item.preview);
+                    resetAnnotationState();
+                    setSelections({});
+                    setAutreDescription('');
+                    setSaveMessage('');
+                    if (item.status !== 'uploaded') {
+                      const { exists, hash, info } = await checkCurrentImageExists(item.file);
+                      if (exists) {
+                        setFileQueue(prev => prev.map((q, i) => i === idx ? { ...q, status: 'uploaded', hash } : q));
+                        setSaveMessage(`⚠️ Image déjà enregistrée (diagnostiquée par ${info?.nom_medecin_diagnostiqueur || 'un médecin'} — ${info?.maladie_nom || ''})`);
+                      } else if (hash) {
+                        setFileQueue(prev => prev.map((q, i) => i === idx ? { ...q, hash } : q));
                       }
                     }
-                  }}
-                  className={`relative cursor-pointer rounded-xl overflow-hidden border-2 flex-shrink-0 transition-all ${
-                    currentIndex === idx
-                      ? 'border-cyan-400 opacity-100'
-                      : 'border-transparent opacity-50 hover:opacity-70'
-                  }`}
-                >
-                  <img src={item.preview} alt="mini" className="w-full h-20 object-cover" />
-
-                  {/* Tic vert : image déjà dans Supabase */}
-                  {item.status === 'uploaded' && (
-                    <div className="absolute inset-0 bg-green-500/60 flex flex-col items-center justify-center gap-1">
-                      <CheckCircle2 size={22} className="text-white drop-shadow" />
-                      <span className="text-[7px] text-white font-bold uppercase tracking-wide">
-                        Déjà enregistrée
-                      </span>
-                    </div>
-                  )}
-
-                  {/* Badge doublon (détecté pendant upload) */}
-                  {item.status === 'duplicate' && (
-                    <div className="absolute inset-0 bg-orange-500/70 flex flex-col items-center justify-center gap-1">
-                      <AlertCircle size={18} className="text-white" />
-                      <span className="text-[7px] text-white font-bold uppercase">Doublon</span>
-                    </div>
-                  )}
-
-                  {/* Spinner pendant la vérification batch */}
-                  {isChecking && item.status === 'pending' && (
-                    <div className="absolute bottom-1 right-1">
-                      <Activity size={10} className="animate-spin text-cyan-300" />
-                    </div>
-                  )}
-                </div>
-              ))
-            )}
+                  }
+                }}
+                className={`relative cursor-pointer rounded-xl overflow-hidden border-2 flex-shrink-0 transition-all ${currentIndex === idx ? 'border-cyan-400 opacity-100' : 'border-transparent opacity-50 hover:opacity-70'}`}
+              >
+                <img src={item.preview} alt="mini" className="w-full h-20 object-cover" />
+                {item.status === 'uploaded' && (
+                  <div className="absolute inset-0 bg-green-500/60 flex flex-col items-center justify-center gap-1">
+                    <CheckCircle2 size={22} className="text-white drop-shadow" />
+                    <span className="text-[7px] text-white font-bold uppercase tracking-wide">Déjà enregistrée</span>
+                  </div>
+                )}
+                {item.status === 'duplicate' && (
+                  <div className="absolute inset-0 bg-orange-500/70 flex flex-col items-center justify-center gap-1">
+                    <AlertCircle size={18} className="text-white" />
+                    <span className="text-[7px] text-white font-bold uppercase">Doublon</span>
+                  </div>
+                )}
+                {isChecking && item.status === 'pending' && (
+                  <div className="absolute bottom-1 right-1">
+                    <Activity size={10} className="animate-spin text-cyan-300" />
+                  </div>
+                )}
+              </div>
+            ))}
           </div>
         </div>
 
@@ -713,22 +578,16 @@ export default function Accueil() {
           {/* ── DIAGNOSTIC ── */}
           <div className="w-[360px] flex-shrink-0 flex flex-col bg-slate-800/30 rounded-3xl border border-white/10 overflow-hidden">
             <div className="px-6 pt-6 pb-2 flex-shrink-0">
-              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest">
-                Diagnostic Médical
-              </h3>
+              <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Diagnostic Médical</h3>
             </div>
 
             <div className="flex-1 overflow-y-auto px-6 pb-6 space-y-3 custom-scrollbar min-h-0">
-
-              {/* Message si image déjà traitée */}
               {currentItemIsAlreadyUploaded && (
                 <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-2xl flex items-center gap-3">
                   <CheckCircle2 size={20} className="text-green-400 flex-shrink-0" />
                   <div>
                     <p className="text-[11px] text-green-400 font-bold">Image déjà enregistrée</p>
-                    <p className="text-[9px] text-slate-400 mt-0.5">
-                      Cette image a déjà été diagnostiquée. Sélectionnez une autre image dans la galerie.
-                    </p>
+                    <p className="text-[9px] text-slate-400 mt-0.5">Cette image a déjà été diagnostiquée. Sélectionnez une autre image dans la galerie.</p>
                   </div>
                 </div>
               )}
@@ -744,12 +603,9 @@ export default function Accueil() {
                           <div className="w-3 h-3 rounded border-2 flex-shrink-0"
                             style={{ backgroundColor: disease?.color, borderColor: disease?.color }} />
                           <span className="text-[10px] text-white font-bold">
-                            {diseaseName === 'Autre' && autreDescription.trim()
-                              ? `Autre — ${autreDescription.trim()}`
-                              : diseaseName}
+                            {diseaseName === 'Autre' && autreDescription.trim() ? `Autre — ${autreDescription.trim()}` : diseaseName}
                           </span>
-                          {annotations[diseaseName] &&
-                            <span className="text-[8px] text-green-400 ml-auto">✓</span>}
+                          {annotations[diseaseName] && <span className="text-[8px] text-green-400 ml-auto">✓</span>}
                         </div>
                       );
                     })}
@@ -765,8 +621,7 @@ export default function Accueil() {
                 const isAutre       = cat.name === 'Autre';
 
                 return (
-                  <div
-                    key={idx}
+                  <div key={idx}
                     className={`p-4 border rounded-2xl transition-all ${
                       currentItemIsAlreadyUploaded
                         ? 'border-white/5 bg-white/5 opacity-30 pointer-events-none'
@@ -778,17 +633,14 @@ export default function Accueil() {
                     }`}
                   >
                     <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center border-2"
-                        style={{ borderColor: cat.color }}>
+                      <div className="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center border-2" style={{ borderColor: cat.color }}>
                         <span className="text-lg">{cat.icon}</span>
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="text-xs font-bold truncate">{cat.name}</div>
                         <div className="text-[9px] text-slate-400 uppercase truncate">{cat.fullName}</div>
                       </div>
-                      <input
-                        type="checkbox"
-                        className="w-5 h-5 accent-cyan-400 flex-shrink-0"
+                      <input type="checkbox" className="w-5 h-5 accent-cyan-400 flex-shrink-0"
                         checked={isSelected}
                         disabled={currentItemIsAlreadyUploaded || (!isSelected && !canCheck)}
                         onChange={(e) => handleDiseaseCheck(cat.name, e.target.checked)}
@@ -799,21 +651,10 @@ export default function Accueil() {
                       <>
                         {isAutre && (
                           <div className="mt-3">
-                            <label className="text-[9px] text-slate-400 uppercase font-bold block mb-1">
-                              Préciser la pathologie *
-                            </label>
-                            <input
-                              type="text"
-                              value={autreDescription}
-                              onChange={(e) => setAutreDescription(e.target.value)}
-                              placeholder="Ex: Otomycose, Corps étranger..."
-                              maxLength={100}
-                              className={`w-full bg-slate-900 text-[11px] text-white placeholder-slate-500 
-                                px-3 py-2 rounded-lg border transition-colors outline-none
-                                ${autreDescription.trim()
-                                  ? 'border-cyan-500/60 focus:border-cyan-400'
-                                  : 'border-red-500/40 focus:border-red-400'
-                                }`}
+                            <label className="text-[9px] text-slate-400 uppercase font-bold block mb-1">Préciser la pathologie *</label>
+                            <input type="text" value={autreDescription} onChange={(e) => setAutreDescription(e.target.value)}
+                              placeholder="Ex: Otomycose, Corps étranger..." maxLength={100}
+                              className={`w-full bg-slate-900 text-[11px] text-white placeholder-slate-500 px-3 py-2 rounded-lg border transition-colors outline-none ${autreDescription.trim() ? 'border-cyan-500/60 focus:border-cyan-400' : 'border-red-500/40 focus:border-red-400'}`}
                             />
                             {!autreDescription.trim()
                               ? <p className="text-[8px] text-red-400 mt-1">⚠️ Champ obligatoire</p>
@@ -823,8 +664,7 @@ export default function Accueil() {
                         )}
 
                         {cat.options[0] !== 'Aucun' && (
-                          <select
-                            className="mt-3 bg-slate-900 text-[10px] p-2 rounded-lg border border-cyan-500/30 w-full text-cyan-100"
+                          <select className="mt-3 bg-slate-900 text-[10px] p-2 rounded-lg border border-cyan-500/30 w-full text-cyan-100"
                             value={selections[cat.name].stage}
                             onChange={(e) => setSelections({ ...selections, [cat.name]: { stage: e.target.value } })}
                           >
@@ -833,8 +673,7 @@ export default function Accueil() {
                           </select>
                         )}
 
-                        <button
-                          onClick={() => handleOpenAnnotation(cat.name)}
+                        <button onClick={() => handleOpenAnnotation(cat.name)}
                           disabled={!canDraw || (isAutre && !autreDescription.trim())}
                           className={`mt-2 w-full py-2 rounded-lg text-[10px] font-bold uppercase flex items-center justify-center gap-2 transition-all ${
                             !canDraw || (isAutre && !autreDescription.trim())
@@ -848,9 +687,7 @@ export default function Accueil() {
                           {hasAnnotation ? 'Modifier le contour' : 'Dessiner le contour'}
                         </button>
                         {isAutre && !autreDescription.trim() && (
-                          <p className="text-[8px] text-slate-500 text-center mt-1">
-                            Précisez d'abord la pathologie
-                          </p>
+                          <p className="text-[8px] text-slate-500 text-center mt-1">Précisez d'abord la pathologie</p>
                         )}
                       </>
                     )}
@@ -862,28 +699,18 @@ export default function Accueil() {
 
           {/* ── ZONE IMAGE + BOUTON ── */}
           <div className="flex-1 flex flex-col gap-3 min-h-0 overflow-hidden">
-
             <div className="flex-1 min-h-0 bg-slate-950 border-2 border-dashed border-white/10 rounded-[2rem] flex items-center justify-center relative overflow-hidden">
               {!selectedImage ? (
                 <label className="cursor-pointer text-center p-8 hover:scale-105 transition-transform">
                   <Upload className="text-cyan-400 mx-auto mb-4" size={44} />
                   <p className="font-black uppercase text-xs text-slate-400">Importer un dossier médical</p>
                   <p className="text-[9px] text-slate-600 mt-1">JPG · PNG · TIFF · WEBP</p>
-                  <input
-                    type="file" className="hidden"
-                    webkitdirectory="true" directory="true" multiple
-                    onChange={handleFolderChange}
-                  />
+                  <input type="file" className="hidden" webkitdirectory="true" directory="true" multiple onChange={handleFolderChange} />
                 </label>
               ) : (
                 <>
-                  <img
-                    src={annotationPreviewUrl || selectedImage}
-                    className="w-full h-full object-contain"
-                    alt="Current"
-                  />
+                  <img src={annotationPreviewUrl || selectedImage} className="w-full h-full object-contain" alt="Current" />
 
-                  {/* Overlay vérification en cours */}
                   {isCurrentImageChecking && (
                     <div className="absolute inset-0 flex items-center justify-center bg-black/50">
                       <div className="bg-slate-800/90 backdrop-blur-sm rounded-2xl px-6 py-4 flex flex-col items-center gap-3 border border-cyan-500/30">
@@ -903,12 +730,9 @@ export default function Accueil() {
                     </div>
                   )}
 
-                  {/* Compteur */}
                   {fileQueue.length > 0 && currentIndex !== null && (
                     <div className="absolute bottom-4 right-4 bg-black/70 backdrop-blur-sm rounded-lg px-3 py-1.5 border border-white/10">
-                      <span className="text-[10px] text-slate-300 font-bold">
-                        {currentIndex + 1} / {fileQueue.length}
-                      </span>
+                      <span className="text-[10px] text-slate-300 font-bold">{currentIndex + 1} / {fileQueue.length}</span>
                     </div>
                   )}
 
@@ -921,12 +745,9 @@ export default function Accueil() {
                           const hasContour = annotations[diseaseName];
                           return (
                             <div key={diseaseName} className="flex items-center gap-2">
-                              <div className="w-2.5 h-2.5 rounded flex-shrink-0"
-                                style={{ backgroundColor: disease?.color }} />
+                              <div className="w-2.5 h-2.5 rounded flex-shrink-0" style={{ backgroundColor: disease?.color }} />
                               <span className="text-[9px] text-white">
-                                {diseaseName === 'Autre' && autreDescription.trim()
-                                  ? `Autre — ${autreDescription.trim()}`
-                                  : diseaseName}
+                                {diseaseName === 'Autre' && autreDescription.trim() ? `Autre — ${autreDescription.trim()}` : diseaseName}
                               </span>
                               {hasContour && <span className="text-[8px] text-green-400">✓</span>}
                             </div>
@@ -939,21 +760,17 @@ export default function Accueil() {
               )}
             </div>
 
-            {/* Bouton valider */}
             <div className="flex-shrink-0 flex flex-col gap-2">
-              <button
-                onClick={handleUpload}
+              <button onClick={handleUpload}
                 disabled={
                   isSaving || isChecking || isCurrentImageChecking || !selectedFile ||
-                  currentItemIsAlreadyUploaded ||
-                  selectedDiseases.length === 0 ||
+                  currentItemIsAlreadyUploaded || selectedDiseases.length === 0 ||
                   !selectedDiseases.every(d => annotations[d]) ||
                   (selectedDiseases.includes('Autre') && !autreDescription.trim())
                 }
                 className={`w-full py-4 rounded-2xl font-black text-sm uppercase tracking-tighter transition-all ${
                   isSaving || isChecking || isCurrentImageChecking || !selectedFile ||
-                  currentItemIsAlreadyUploaded ||
-                  selectedDiseases.length === 0 ||
+                  currentItemIsAlreadyUploaded || selectedDiseases.length === 0 ||
                   !selectedDiseases.every(d => annotations[d]) ||
                   (selectedDiseases.includes('Autre') && !autreDescription.trim())
                     ? 'bg-slate-800 opacity-50 cursor-not-allowed'
@@ -963,9 +780,7 @@ export default function Accueil() {
                 {isSaving
                   ? <Activity className="animate-spin mx-auto" />
                   : isChecking
-                    ? <span className="flex items-center justify-center gap-2">
-                        <Activity size={14} className="animate-spin" /> Vérification en cours...
-                      </span>
+                    ? <span className="flex items-center justify-center gap-2"><Activity size={14} className="animate-spin" /> Vérification en cours...</span>
                     : currentItemIsAlreadyUploaded
                       ? '✓ Image déjà enregistrée'
                       : `Valider ${selectedDiseases.length} maladie(s)`
@@ -983,7 +798,6 @@ export default function Accueil() {
                 </div>
               )}
             </div>
-
           </div>
         </div>
       </div>

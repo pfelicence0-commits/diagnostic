@@ -15,6 +15,27 @@ const categoryOptions = [
   { name: 'Autre', fullName: 'Autre Pathologie', options: [] }
 ];
 
+const MALADIE_COLORS = {
+  'OMA':       '#f87171',  // rouge
+  'OSM':       '#fbbf24',  // jaune
+  'Perfo':     '#60a5fa',  // bleu
+  'Chole':     '#a78bfa',  // violet
+  'PDR + Atel':'#f97316',  // orange
+  'Normal':    '#34d399',  // vert
+  'Autre':     '#94a3b8',  // gris
+};
+
+// Extraire les contours d'un annotation_details (ancien ou nouveau format)
+const extractContours = (details) => {
+  if (!details) return [];
+  // Nouveau format : { contours: [...] }
+  if (details.contours && Array.isArray(details.contours)) return details.contours;
+  // Ancien format : { points_normalized: [...] } → contour unique sans maladie
+  if (details.points_normalized?.length >= 3)
+    return [{ maladie: null, color: '#22d3ee', points_normalized: details.points_normalized }];
+  return [];
+};
+
 const MesImages = () => {
   const [activeTab, setActiveTab]         = useState('mes-diagnostics');
   const [allDataGrouped, setAllDataGrouped] = useState([]);
@@ -37,14 +58,25 @@ const MesImages = () => {
   const [searchTerm, setSearchTerm]       = useState('');
   const [searchDoctor, setSearchDoctor]   = useState('');
   const [showAnnotationModal, setShowAnnotationModal] = useState(false);
-  const [annotationPayload, setAnnotationPayload] = useState(null);
+  const [annotationPayload, setAnnotationPayload] = useState(null);       // contour courant en cours de tracé
   const [annotationPreviewUrl, setAnnotationPreviewUrl] = useState('');
   const [annotationSourceUrl, setAnnotationSourceUrl] = useState('');
+  const [contoursParMaladie, setContoursParMaladie] = useState({});       // { maladie: payload }
+  const [currentAnnotMaladie, setCurrentAnnotMaladie] = useState(null);  // maladie en cours de tracé
 
   const [currentUser, setCurrentUser]     = useState(null);
   const [sessionMode, setSessionMode]     = useState('solo');
   const [collaborator, setCollaborator]   = useState(null);
   const [convertedImages, setConvertedImages] = useState({});
+
+  // ── Annotations chargées depuis Supabase (hash → annotation_details) ──
+  const [annotationsMap, setAnnotationsMap] = useState({});
+  // ── États pour visualisation / édition contour depuis la carte ──────────
+  const [editContourGroup,   setEditContourGroup]   = useState(null);
+  const [editContourSrc,     setEditContourSrc]     = useState('');
+  const [editContourMaladie, setEditContourMaladie] = useState(null); // maladie ciblée
+  const [showEditContour,    setShowEditContour]    = useState(false);
+  const [viewContourGroup,   setViewContourGroup]   = useState(null);
 
   useEffect(() => {
     const storedUser  = localStorage.getItem('user');
@@ -123,6 +155,146 @@ const MesImages = () => {
     return <img src={displaySrc} alt={alt} className={className} />;
   };
 
+  /* ─── Image avec contour SVG superposé ─── */
+  const ImageWithContour = ({ src, alt, className, annotations }) => {
+    const [displaySrc, setDisplaySrc] = useState(src);
+    const [isConverting, setIsConverting] = useState(false);
+    const [imgSize, setImgSize] = useState({ w: 1, h: 1 });
+    const imgRef = React.useRef(null);
+
+    useEffect(() => {
+      let cancelled = false;
+      const load = async () => {
+        if (isTiffUrl(src)) {
+          setIsConverting(true);
+          const converted = await convertTiffUrl(src);
+          if (!cancelled) { setDisplaySrc(converted); setIsConverting(false); }
+        } else { setDisplaySrc(src); }
+      };
+      load();
+      return () => { cancelled = true; };
+    }, [src]);
+
+    const handleLoad = () => {
+      if (imgRef.current)
+        setImgSize({ w: imgRef.current.clientWidth, h: imgRef.current.clientHeight });
+    };
+
+    if (isConverting) {
+      return (
+        <div className={className + ' flex items-center justify-center bg-slate-700'}>
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-cyan-400" />
+        </div>
+      );
+    }
+
+    // Extraire tous les contours de toutes les annotations reçues
+    const allContours = (Array.isArray(annotations) ? annotations : annotations ? [annotations] : [])
+      .flatMap(ann => extractContours(ann));
+    const hasAny = allContours.some(c => c.points_normalized?.length >= 3);
+
+    return (
+      <div className={`relative ${className}`} style={{ overflow: 'hidden' }}>
+        <img ref={imgRef} src={displaySrc} alt={alt} onLoad={handleLoad}
+             className="w-full h-full object-cover"/>
+        {hasAny && (
+          <svg className="absolute inset-0 pointer-events-none"
+               width={imgSize.w} height={imgSize.h}
+               style={{ position: 'absolute', top: 0, left: 0 }}>
+            {allContours.map((contour, idx) => {
+              const pts = contour.points_normalized || [];
+              if (pts.length < 3) return null;
+              const color   = contour.color || '#22d3ee';
+              const polyStr = pts.map(p =>
+                `${(p.x * imgSize.w).toFixed(1)},${(p.y * imgSize.h).toFixed(1)}`).join(' ');
+              return (
+                <g key={idx}>
+                  <polygon points={polyStr} fill={`${color}30`} stroke={color}
+                           strokeWidth="2.5" strokeLinejoin="round"/>
+                  {pts.map((p, i) => (
+                    <circle key={i} cx={(p.x*imgSize.w).toFixed(1)} cy={(p.y*imgSize.h).toFixed(1)}
+                            r="4" fill={color} stroke="white" strokeWidth="1.5"/>
+                  ))}
+                </g>
+              );
+            })}
+          </svg>
+        )}
+        {!hasAny && (
+          <div className="absolute inset-0 flex items-end justify-center pb-2 pointer-events-none">
+            <span className="text-[9px] bg-black/50 text-slate-400 px-2 py-0.5 rounded-full uppercase tracking-wide">
+              Aucun contour tracé
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /* ─── ContourViewer : image + SVG haute qualité pour la modale ─── */
+  const ContourViewer = ({ src, annotations }) => {
+    const [displaySrc, setDisplaySrc] = useState(src);
+    const [imgSize, setImgSize]       = useState({ w: 1, h: 1 });
+    const imgRef = React.useRef(null);
+
+    useEffect(() => {
+      let cancelled = false;
+      const load = async () => {
+        if (isTiffUrl(src)) {
+          const conv = await convertTiffUrl(src);
+          if (!cancelled) setDisplaySrc(conv);
+        } else setDisplaySrc(src);
+      };
+      load();
+      return () => { cancelled = true; };
+    }, [src]);
+
+    const handleLoad = () => {
+      if (imgRef.current)
+        setImgSize({ w: imgRef.current.clientWidth, h: imgRef.current.clientHeight });
+    };
+
+    const allContours = (Array.isArray(annotations) ? annotations : annotations ? [annotations] : [])
+      .flatMap(ann => extractContours(ann));
+
+    return (
+      <div className="relative inline-block max-h-[60vh]">
+        <img ref={imgRef} src={displaySrc} alt="Tympan" onLoad={handleLoad}
+             className="max-h-[60vh] max-w-full object-contain rounded-xl"/>
+        {allContours.some(c => c.points_normalized?.length >= 3) && (
+          <svg className="absolute inset-0 pointer-events-none"
+               width={imgSize.w} height={imgSize.h}
+               style={{ position: 'absolute', top: 0, left: 0 }}>
+            {allContours.map((contour, idx) => {
+              const pts = contour.points_normalized || [];
+              if (pts.length < 3) return null;
+              const color   = contour.color || '#22d3ee';
+              const polyStr = pts.map(p =>
+                `${(p.x*imgSize.w).toFixed(1)},${(p.y*imgSize.h).toFixed(1)}`).join(' ');
+              return (
+                <g key={idx}>
+                  <polygon points={polyStr} fill={`${color}26`} stroke={color}
+                           strokeWidth="2.5" strokeLinejoin="round"/>
+                  {pts.map((p, i) => {
+                    const cx = (p.x*imgSize.w).toFixed(1);
+                    const cy = (p.y*imgSize.h).toFixed(1);
+                    return (
+                      <g key={i}>
+                        <circle cx={cx} cy={cy} r="5" fill={color} stroke="white" strokeWidth="1.5"/>
+                        <text x={Number(cx)+9} y={Number(cy)-8} fill="white" fontSize="11" fontWeight="bold"
+                              style={{ textShadow: '0 0 3px rgba(0,0,0,0.9)' }}>{i+1}</text>
+                      </g>
+                    );
+                  })}
+                </g>
+              );
+            })}
+          </svg>
+        )}
+      </div>
+    );
+  };
+
   /* ─── Données ─── */
   const groupData = (data) => {
     if (!data || !Array.isArray(data)) return [];
@@ -140,11 +312,55 @@ const MesImages = () => {
       .from('categories_diagnostics')
       .select('*')
       .order('created_at', { ascending: false });
-    if (error) console.error('Erreur Fetch:', error.message);
-    else setAllDataGrouped(groupData(data));
+    if (error) { console.error('Erreur Fetch:', error.message); return; }
+    setAllDataGrouped(groupData(data));
+
+    // Charger les annotations — fetchData reçoit l'userId en paramètre
+    // pour éviter le problème de closure sur currentUserId (null au premier render)
+    try {
+      const { data: annots, error: annotError } = await supabase
+        .from('annotations_maladie')
+        .select('image_hash, utilisateur_id, annotation_details, annotated_image_url');
+
+      if (annotError) { console.error('❌ Erreur annotations:', annotError.message); return; }
+
+      if (annots && annots.length > 0) {
+        const map = {};
+        annots.forEach(a => {
+          const key = `${a.image_hash}__${a.utilisateur_id}`;
+          if (!map[key]) map[key] = a;
+        });
+        setAnnotationsMap(map);
+      }
+    } catch (e) { console.warn('Annotations non chargées:', e); }
   };
 
-  useEffect(() => { if (currentUserId) fetchData(); }, [currentUserId]);
+  useEffect(() => {
+    if (!currentUserId) return;
+    fetchData();
+  }, [currentUserId]);
+
+  // Charger les annotations indépendamment dès le montage
+  // (ne dépend pas de currentUserId — toutes les annotations sont publiques)
+  useEffect(() => {
+    const loadAnnotations = async () => {
+      try {
+        const { data: annots, error } = await supabase
+          .from('annotations_maladie')
+          .select('image_hash, utilisateur_id, annotation_details, annotated_image_url');
+        if (error) { console.error('annotations load error:', error.message); return; }
+        if (annots && annots.length > 0) {
+          const map = {};
+          annots.forEach(a => {
+            const key = `${a.image_hash}__${a.utilisateur_id}`;
+            if (!map[key]) map[key] = a;
+          });
+          setAnnotationsMap(map);
+        }
+      } catch (e) { console.warn('loadAnnotations error:', e); }
+    };
+    loadAnnotations();
+  }, []); // ← au montage uniquement, sans dépendance
 
   const normalizeAvis = (maladie_nom, stade_nom) => {
     const maladies = (maladie_nom || '').split('+').map(m => m.trim());
@@ -328,35 +544,58 @@ const MesImages = () => {
   };
 
   const saveAnnotationRecord = async ({ diagnosticId, imageHash }) => {
-    if (!annotationPayload || !annotationPreviewUrl || !diagnosticId) return;
-    const fileName = `annotation_${Date.now()}_${currentUserId}.png`;
+    if (!diagnosticId) return;
+    // Construire le tableau de contours depuis contoursParMaladie
+    const contours = Object.entries(contoursParMaladie)
+      .filter(([, payload]) => payload?.points_normalized?.length >= 3)
+      .map(([maladie, payload]) => ({
+        maladie,
+        color:             MALADIE_COLORS[maladie] || '#22d3ee',
+        points_normalized: payload.points_normalized,
+        points_pixels:     payload.points_pixels,
+        bounding_box:      payload.bounding_box,
+        created_at:        new Date().toISOString(),
+      }));
+    if (contours.length === 0) return;
+    const newDetails = { contours };
+
+    // Upload preview du premier contour
+    const firstPayload = Object.values(contoursParMaladie).find(p => p?.points_normalized?.length >= 3);
+    const src     = annotationSourceUrl || selectedGroup?.image_url || '';
+    const preview = firstPayload ? await buildAnnotatedImageDataUrl(src, firstPayload) : null;
+    const fileName    = `annotation_${Date.now()}_${currentUserId}.png`;
     const storagePath = `annotations/${imageHash}/${fileName}`;
-    const blob = await dataUrlToBlob(annotationPreviewUrl);
-    const { error: uploadError } = await supabase.storage
-      .from('images')
-      .upload(storagePath, blob, { contentType: 'image/png', upsert: true });
-    if (uploadError) throw uploadError;
+
+    if (preview) {
+      const blob = await dataUrlToBlob(preview);
+      const { error: uploadError } = await supabase.storage
+        .from('images').upload(storagePath, blob, { contentType: 'image/png', upsert: true });
+      if (uploadError) throw uploadError;
+    }
     const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(storagePath);
-    const { error: annotationInsertError } = await supabase
+
+    const { error: insertError } = await supabase
       .from('annotations_maladie')
       .insert([{
-        diagnostic_id: diagnosticId,
-        image_hash: imageHash,
-        utilisateur_id: currentUserId,
-        image_original_url: selectedGroup?.image_url || '',
+        diagnostic_id:        diagnosticId,
+        image_hash:           imageHash,
+        utilisateur_id:       currentUserId,
+        image_original_url:   selectedGroup?.image_url || '',
         annotated_image_path: storagePath,
-        annotated_image_url: publicUrl,
-        annotation_details: annotationPayload,
+        annotated_image_url:  publicUrl,
+        annotation_details:   newDetails,
       }]);
-    if (annotationInsertError) throw annotationInsertError;
+    if (insertError) throw insertError;
   };
 
   const handleAddAvis = async () => {
     setError('');
     const keys = Object.keys(multiSelections);
     if (keys.length === 0) { setError('Sélectionnez au moins une pathologie.'); return; }
-    if (!annotationPayload) {
-      setError('Veuillez tracer le contour de la maladie avant validation.');
+    // Vérifier qu'au moins un contour a été tracé
+    const contoursTracés = Object.keys(contoursParMaladie).filter(k => contoursParMaladie[k]);
+    if (contoursTracés.length === 0) {
+      setError('Veuillez tracer au moins un contour avant validation.');
       return;
     }
     try {
@@ -413,10 +652,123 @@ const MesImages = () => {
       setAnnotationPayload(null);
       setAnnotationPreviewUrl('');
       setAnnotationSourceUrl('');
+      setContoursParMaladie({});
+      setCurrentAnnotMaladie(null);
       fetchData();
     } catch (err) {
       console.error(err);
       setError("Erreur lors de l'enregistrement.");
+    }
+  };
+
+  /* ─── Modifier contour depuis la carte (par maladie) ─── */
+  const handleEditContour = async (group, maladie = null) => {
+    setEditContourGroup(group);
+    setEditContourMaladie(maladie);
+    const src = isTiffUrl(group.image_url)
+      ? await convertTiffUrl(group.image_url)
+      : group.image_url;
+    setEditContourSrc(src);
+    setShowEditContour(true);
+  };
+
+  const handleEditContourSave = async (payload) => {
+    if (!editContourGroup) return;
+    try {
+      const hash = editContourGroup.image_hash;
+      const color = editContourMaladie ? (MALADIE_COLORS[editContourMaladie] || '#22d3ee') : '#22d3ee';
+
+      // Récupérer l'annotation existante pour fusionner les contours
+      const existingKey  = `${hash}__${currentUserId}`;
+      const existingData = annotationsMap[existingKey]?.annotation_details;
+      const existingContours = extractContours(existingData);
+
+      // Remplacer le contour de cette maladie ou en ajouter un nouveau
+      const newContour = {
+        maladie:           editContourMaladie,
+        color,
+        points_normalized: payload.points_normalized,
+        points_pixels:     payload.points_pixels,
+        bounding_box:      payload.bounding_box,
+        created_at:        new Date().toISOString(),
+      };
+      const updatedContours = [
+        ...existingContours.filter(c => c.maladie !== editContourMaladie),
+        newContour,
+      ];
+      const newDetails = { contours: updatedContours };
+
+      // Upload image annotée avec TOUS les contours
+      const src     = editContourSrc || editContourGroup.image_url;
+      // Générer preview avec le nouveau contour uniquement
+      const preview = await buildAnnotatedImageDataUrl(src, payload);
+      const blob    = await dataUrlToBlob(preview);
+      const fileName    = `annotation_${Date.now()}_${currentUserId}.png`;
+      const storagePath = `annotations/${hash}/${fileName}`;
+
+      const { error: upErr } = await supabase.storage
+        .from('images').upload(storagePath, blob, { contentType: 'image/png', upsert: true });
+      if (upErr) throw upErr;
+
+      const { data: { publicUrl } } = supabase.storage.from('images').getPublicUrl(storagePath);
+      const diagId = await getLatestDiagnosticIdForUser(hash, currentUserId);
+
+      const { error: upsertErr } = await supabase
+        .from('annotations_maladie')
+        .upsert([{
+          diagnostic_id:        diagId,
+          image_hash:           hash,
+          utilisateur_id:       currentUserId,
+          image_original_url:   editContourGroup.image_url,
+          annotated_image_path: storagePath,
+          annotated_image_url:  publicUrl,
+          annotation_details:   newDetails,
+        }], { onConflict: 'image_hash,utilisateur_id' });
+      if (upsertErr) throw upsertErr;
+
+      setShowEditContour(false);
+      setEditContourGroup(null);
+      setEditContourMaladie(null);
+      fetchData();
+    } catch (e) {
+      console.error('Erreur sauvegarde contour:', e);
+    }
+  };
+
+  /* ─── Réinitialiser contour d'une maladie (ou tous) ─── */
+  const handleResetContour = async (group, maladie = null) => {
+    const hash = group.image_hash;
+    try {
+      if (maladie) {
+        // Supprimer uniquement le contour de cette maladie
+        const existingKey     = `${hash}__${currentUserId}`;
+        const existingData    = annotationsMap[existingKey]?.annotation_details;
+        const existingContours = extractContours(existingData);
+        const updatedContours  = existingContours.filter(c => c.maladie !== maladie);
+        const newDetails = { contours: updatedContours };
+        const diagId = await getLatestDiagnosticIdForUser(hash, currentUserId);
+        const { error } = await supabase
+          .from('annotations_maladie')
+          .upsert([{
+            diagnostic_id:      diagId,
+            image_hash:         hash,
+            utilisateur_id:     currentUserId,
+            image_original_url: group.image_url,
+            annotation_details: newDetails,
+          }], { onConflict: 'image_hash,utilisateur_id' });
+        if (error) throw error;
+      } else {
+        // Supprimer tous les contours
+        const { error } = await supabase
+          .from('annotations_maladie')
+          .delete()
+          .eq('image_hash', hash)
+          .eq('utilisateur_id', currentUserId);
+        if (error) throw error;
+      }
+      fetchData();
+    } catch (e) {
+      console.error('Erreur réinitialisation contour:', e);
     }
   };
 
@@ -577,13 +929,73 @@ const MesImages = () => {
             const status = getAvisStatus(group);
             return (
               <div key={group.image_hash} className={`relative bg-slate-800 rounded-[2.5rem] overflow-hidden border transition-all ${status === 'validated' ? 'border-purple-500/50' : status === 'divergent' ? 'border-red-500/40' : 'border-white/5'}`}>
-                <div className="relative h-56">
-                  <ImageDisplay src={group.image_url} alt="Tympan" className="w-full h-full object-cover" />
-                  <div className="absolute top-4 right-4 flex gap-2">
-                    {status === 'validated' && <span className="bg-purple-600 px-3 py-1 rounded-full text-[8px] font-bold uppercase">Validé</span>}
-                    {status === 'divergent' && <span className="bg-red-600    px-3 py-1 rounded-full text-[8px] font-bold uppercase">Divergent</span>}
-                  </div>
-                </div>
+                {(() => {
+                  const myAvi        = group.avis.find(a => a.utilisateur_id === currentUserId);
+                  const isMyDiag     = activeTab === 'mes-diagnostics' && !!myAvi;
+                  // Récupérer TOUTES les annotations de cette image (tous médecins)
+                  const allGroupAnnotations = Object.values(annotationsMap)
+                    .filter(a => a.image_hash === group.image_hash)
+                    .map(a => a.annotation_details)
+                    .filter(Boolean);
+                  // DEBUG
+                  if (allGroupAnnotations.length > 0) {
+                    const contourCount = allGroupAnnotations.flatMap(a => extractContours(a)).length;
+                    if (contourCount !== allGroupAnnotations.length) {
+                      console.log('🎨 image:', group.image_hash.slice(0,8),
+                        '| annotation_details[0]:', JSON.stringify(allGroupAnnotations[0]).slice(0,120),
+                        '| extractContours result:', extractContours(allGroupAnnotations[0]).length, 'contours');
+                    }
+                  }
+                  // Annotation du médecin courant (pour savoir s'il a tracé le sien)
+                  const myAnnotKey   = `${group.image_hash}__${currentUserId}`;
+                  const myAnnotation = annotationsMap[myAnnotKey]?.annotation_details || null;
+                  const hasContour   = allGroupAnnotations.some(a => a?.points_normalized?.length >= 3);
+                  return (
+                    <div
+                      className={`relative h-56 ${isMyDiag ? 'cursor-pointer group/img' : ''}`}
+                      onClick={isMyDiag ? () => setViewContourGroup(group) : undefined}
+                      title={isMyDiag ? 'Cliquer pour voir le contour' : undefined}
+                    >
+                      <ImageWithContour
+                        src={group.image_url}
+                        alt="Tympan"
+                        className="w-full h-full"
+                        annotations={isMyDiag ? allGroupAnnotations : []}
+                      />
+                      {/* Hover hint */}
+                      {isMyDiag && (
+                        <div className="absolute inset-0 bg-black/0 group-hover/img:bg-black/30 transition-all flex items-center justify-center">
+                          <span className="opacity-0 group-hover/img:opacity-100 transition-opacity bg-black/70 backdrop-blur-sm text-white text-[10px] font-bold uppercase px-3 py-2 rounded-xl flex items-center gap-2">
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                            Voir les contours
+                          </span>
+                        </div>
+                      )}
+                      {/* Badge statut */}
+                      <div className="absolute top-3 right-3 flex gap-2 pointer-events-none">
+                        {status === 'validated' && <span className="bg-purple-600 px-3 py-1 rounded-full text-[8px] font-bold uppercase shadow-lg">Validé</span>}
+                        {status === 'divergent' && <span className="bg-red-600 px-3 py-1 rounded-full text-[8px] font-bold uppercase shadow-lg">Divergent</span>}
+                      </div>
+                      {/* Indicateur contour en bas à gauche */}
+                      {isMyDiag && (
+                        <div className="absolute bottom-2 left-3 pointer-events-none">
+                          {(() => {
+                            const myAnnotData  = annotationsMap[`${group.image_hash}__${currentUserId}`]?.annotation_details;
+                            const myContours   = extractContours(myAnnotData).filter(c => c.points_normalized?.length >= 3);
+                            const totalContours = allGroupAnnotations.flatMap(a => extractContours(a)).filter(c => c.points_normalized?.length >= 3).length;
+                            return totalContours > 0
+                              ? <span className="text-[9px] bg-cyan-500/80 backdrop-blur-sm text-white px-2 py-0.5 rounded-full font-bold uppercase flex items-center gap-1">
+                                  <svg className="w-2.5 h-2.5" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd"/></svg>
+                                  {totalContours} contour{totalContours > 1 ? 's' : ''}
+                                  {myContours.length > 0 && ` (${myContours.length} mien${myContours.length > 1 ? 's' : ''})`}
+                                </span>
+                              : <span className="text-[9px] bg-slate-700/80 backdrop-blur-sm text-slate-400 px-2 py-0.5 rounded-full font-bold uppercase">Aucun contour</span>;
+                          })()}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
                 <div className="p-6 space-y-3">
                   {activeTab === 'mes-diagnostics' && group.avis.map(avi => (
                     <div key={avi.id} className={`p-4 rounded-2xl border ${avi.utilisateur_id === currentUserId ? 'bg-cyan-500/10 border-cyan-500/30' : 'bg-slate-900 border-transparent'}`}>
@@ -712,23 +1124,41 @@ const MesImages = () => {
 
                   {modalMode === 'add' ? (
                     <div className="space-y-4">
-                      <div className="flex items-center justify-between gap-3 p-3 rounded-2xl border border-cyan-500/30 bg-cyan-500/10">
-                        <div>
-                          <p className="text-[10px] font-bold uppercase text-cyan-400">Contour maladie</p>
-                          <p className="text-[10px] text-slate-300">Tracer la zone malade avant validation.</p>
-                        </div>
-                        <button
-                          onClick={openAnnotationModal}
-                          className="px-4 py-2 text-[10px] font-black uppercase bg-cyan-600 rounded-xl hover:bg-cyan-500"
-                        >
-                          {annotationPayload ? 'Modifier contour' : 'Tracer contour'}
-                        </button>
+                      {/* Bouton de contour par maladie cochée */}
+                      <div className="space-y-2">
+                        <p className="text-[10px] font-black text-slate-400 uppercase ml-1">Contours par maladie</p>
+                        {Object.keys(multiSelections).length === 0 ? (
+                          <p className="text-[10px] text-slate-500 italic px-1">Cochez d'abord une pathologie ci-dessous</p>
+                        ) : Object.keys(multiSelections).map(maladie => {
+                          const color   = MALADIE_COLORS[maladie] || '#22d3ee';
+                          const traced  = !!contoursParMaladie[maladie];
+                          return (
+                            <div key={maladie}
+                              className="flex items-center justify-between gap-3 p-3 rounded-2xl border"
+                              style={{ borderColor: `${color}60`, backgroundColor: `${color}15` }}
+                            >
+                              <div className="flex items-center gap-2">
+                                <div className="w-3 h-3 rounded-full" style={{ backgroundColor: color }}/>
+                                <div>
+                                  <p className="text-[10px] font-bold uppercase" style={{ color }}>
+                                    {maladie}
+                                  </p>
+                                  <p className="text-[9px] text-slate-400">
+                                    {traced ? '✓ Contour tracé' : 'Non tracé'}
+                                  </p>
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => openAnnotationModal(maladie)}
+                                className="px-3 py-1.5 text-[10px] font-black uppercase rounded-xl text-white transition-all hover:opacity-80"
+                                style={{ backgroundColor: color }}
+                              >
+                                {traced ? 'Modifier' : 'Tracer'}
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
-                      {annotationPreviewUrl && (
-                        <div className="rounded-2xl border border-white/10 overflow-hidden">
-                          <img src={annotationPreviewUrl} alt="Aperçu annotation" className="w-full h-32 object-cover" />
-                        </div>
-                      )}
                       <div className="space-y-2 overflow-y-auto max-h-[260px] pr-1 custom-scrollbar">
                         {categoryOptions.map(cat => {
                           const isChecked = !!multiSelections[cat.name];
@@ -829,10 +1259,173 @@ const MesImages = () => {
         </div>
       )}
 
+      {/* ─── MODALE VISUALISATION CONTOUR (clic sur image) ─── */}
+      {viewContourGroup && (() => {
+        const hash         = viewContourGroup.image_hash;
+        const annotKey     = `${hash}__${currentUserId}`;
+        const myAnnotation = annotationsMap[annotKey]?.annotation_details || null;
+        // Toutes les annotations de cette image
+        const allAnnotations = Object.values(annotationsMap)
+          .filter(a => a.image_hash === hash)
+          .map(a => a.annotation_details)
+          .filter(Boolean);
+        const points       = allAnnotations.flatMap(a => a?.points_normalized || []);
+        const hasContour   = allAnnotations.some(a => (a?.points_normalized?.length || 0) >= 3);
+        const imgUrl       = viewContourGroup.image_url;
+        const myAvi        = viewContourGroup.avis.find(a => a.utilisateur_id === currentUserId);
+
+        return (
+          <div
+            className="fixed inset-0 z-[55] bg-black/95 backdrop-blur-sm flex flex-col items-center justify-center p-4"
+            onClick={e => { if (e.target === e.currentTarget) setViewContourGroup(null); }}
+          >
+            <div className="w-full max-w-3xl bg-slate-800 border border-white/10 rounded-[2rem] overflow-hidden shadow-2xl flex flex-col">
+
+              {/* Header */}
+              <div className="flex items-center justify-between px-6 py-4 border-b border-white/10">
+                <div className="flex items-center gap-3">
+                  <div className={`w-2.5 h-2.5 rounded-full ${hasContour ? 'bg-cyan-400' : 'bg-slate-500'}`} />
+                  <div>
+                    <p className="text-sm font-black uppercase tracking-wider text-white">
+                      {myAvi?.maladie_nom || 'Diagnostic'}
+                      {myAvi?.stade_nom && myAvi.stade_nom !== 'Standard' ? ` (${myAvi.stade_nom})` : ''}
+                    </p>
+                    <p className="text-[10px] text-slate-400 mt-0.5 uppercase">
+                      {hasContour ? `${points.length} points · Contour tracé` : 'Aucun contour pour cette image'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setViewContourGroup(null)}
+                  className="p-2 text-slate-400 hover:text-white hover:bg-slate-700 rounded-xl transition-all"
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12"/></svg>
+                </button>
+              </div>
+
+              {/* Image + contour SVG plein écran */}
+              <div className="relative bg-slate-900 flex items-center justify-center" style={{ minHeight: '400px' }}>
+                <ContourViewer src={imgUrl} annotations={allAnnotations} />
+                {!hasContour && (
+                  <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                    <div className="bg-slate-800/80 backdrop-blur-sm border border-white/10 rounded-2xl px-6 py-4 text-center">
+                      <p className="text-slate-400 text-xs font-bold uppercase">Aucun contour tracé</p>
+                      <p className="text-slate-500 text-[10px] mt-1">Cliquez sur "Tracer le contour" pour commencer</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Légende couleurs médecins */}
+              {hasContour && (() => {
+                const COLORS = ['#22d3ee', '#f59e0b', '#a78bfa', '#34d399', '#f87171'];
+                const annotEntries = Object.values(annotationsMap).filter(a => a.image_hash === hash);
+                return (
+                  <div className="px-6 py-3 border-t border-white/5 flex flex-wrap gap-3">
+                    {annotEntries.map((a, i) => {
+                      const doc = viewContourGroup.avis.find(v => v.utilisateur_id === a.utilisateur_id);
+                      return (
+                        <div key={i} className="flex items-center gap-1.5">
+                          <div className="w-3 h-3 rounded-full border-2 border-white/30"
+                               style={{ backgroundColor: COLORS[i % COLORS.length] }}/>
+                          <span className="text-[10px] text-slate-400">
+                            {doc ? `Dr. ${doc.nom_medecin_diagnostiqueur}` : 'Médecin'}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+
+              {/* Actions — un bouton par maladie diagnostiquée */}
+              <div className="p-5 border-t border-white/10 space-y-3">
+                {(() => {
+                  const myAnnotData  = annotationsMap[`${hash}__${currentUserId}`]?.annotation_details;
+                  const myContours   = extractContours(myAnnotData);
+                  // Maladies diagnostiquées par le médecin courant sur cette image
+                  const maladies = (myAvi?.maladie_nom || '')
+                    .split('+').map(m => m.trim()).filter(Boolean);
+                  const targets = maladies.length > 0 ? maladies : [null];
+                  return (
+                    <>
+                      <div className="flex flex-wrap gap-2">
+                        {targets.map(maladie => {
+                          const color    = maladie ? (MALADIE_COLORS[maladie] || '#22d3ee') : '#22d3ee';
+                          const existing = myContours.find(c => c.maladie === maladie);
+                          return (
+                            <button key={maladie || 'global'}
+                              onClick={async () => {
+                                setViewContourGroup(null);
+                                await handleEditContour(viewContourGroup, maladie);
+                              }}
+                              className="flex-1 flex items-center justify-center gap-2 py-3 rounded-2xl text-[11px] font-black uppercase tracking-wide transition-all text-white"
+                              style={{ backgroundColor: color, minWidth: '140px' }}
+                            >
+                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536M9 13l6.586-6.586a2 2 0 012.828 2.828L11.828 15.828A2 2 0 0110 16.414H8v-2a2 2 0 01.586-1.414z"/>
+                              </svg>
+                              {existing ? `Modifier` : `Tracer`} {maladie || 'contour'}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="flex gap-2">
+                        {myContours.length > 0 && (
+                          <button
+                            onClick={async () => {
+                              if (window.confirm('Supprimer tous les contours de cette image ?')) {
+                                await handleResetContour(viewContourGroup, null);
+                                setViewContourGroup(null);
+                              }
+                            }}
+                            className="flex items-center gap-2 px-4 py-2.5 bg-red-600/80 hover:bg-red-500 rounded-2xl text-[11px] font-black uppercase tracking-wide transition-all"
+                          >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M9 7h6m-7 0a1 1 0 001-1h4a1 1 0 001 1m-6 0h6"/>
+                            </svg>
+                            Tout réinitialiser
+                          </button>
+                        )}
+                        <button onClick={() => setViewContourGroup(null)}
+                          className="ml-auto px-5 py-2.5 bg-slate-700 hover:bg-slate-600 rounded-2xl text-[11px] font-black uppercase tracking-wide transition-all text-slate-300">
+                          Fermer
+                        </button>
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ─── MODALE ÉDITION CONTOUR DEPUIS LA CARTE ─── */}
+      {showEditContour && editContourSrc && (
+        <AnnotationCanvas
+          imageSrc={editContourSrc}
+          initialPoints={(() => {
+            if (!editContourGroup) return [];
+            const key     = `${editContourGroup.image_hash}__${currentUserId}`;
+            const details = annotationsMap[key]?.annotation_details;
+            const contours = extractContours(details);
+            const match   = contours.find(c => c.maladie === editContourMaladie);
+            return match?.points_normalized || [];
+          })()}
+          annotationColor={editContourMaladie ? (MALADIE_COLORS[editContourMaladie] || '#22d3ee') : '#22d3ee'}
+          diseaseName={editContourMaladie || ''}
+          onClose={() => { setShowEditContour(false); setEditContourGroup(null); setEditContourMaladie(null); }}
+          onSave={handleEditContourSave}
+        />
+      )}
+
       {showAnnotationModal && annotationSourceUrl && (
         <AnnotationCanvas
           imageSrc={annotationSourceUrl}
           initialPoints={annotationPayload?.points_normalized || []}
+          annotationColor={currentAnnotMaladie ? (MALADIE_COLORS[currentAnnotMaladie] || '#22d3ee') : '#22d3ee'}
+          diseaseName={currentAnnotMaladie || ''}
           onClose={() => setShowAnnotationModal(false)}
           onSave={handleAnnotationSave}
         />
