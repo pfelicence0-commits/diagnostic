@@ -415,6 +415,39 @@ const MesImages = () => {
     return nom.split('+').map(p => p.trim()).filter(Boolean);
   };
 
+  // Extraire les maladies individuelles d'un diagnostic
+  // "PDR + Atel + Chole (Stade III / Post-Sup)" → ["PDR + Atel", "Chole"]
+  // "OMA + Perfo" → ["OMA", "Perfo"]
+  const MALADIES_CONNUES = [
+    'PDR + Atel', 'PDR + ATEL',  // composée → tester en PREMIER (avant split)
+    'OMA', 'OSM', 'Perfo', 'Chole', 'Normal', 'Autre',
+  ];
+
+  const extractMaladiesFromDiag = (maladieNom) => {
+    if (!maladieNom) return [];
+    // Retirer les stades entre parenthèses
+    let nom = maladieNom.trim().replace(/\([^)]*\)/g, '').trim();
+    const result = [];
+    // Chercher les maladies composées en premier (approche simple sans regex complexe)
+    for (const m of MALADIES_CONNUES) {
+      // Normaliser espaces pour la comparaison
+      const mNorm = m.toLowerCase().replace(/\s+/g, ' ').trim();
+      const nomNorm = nom.toLowerCase().replace(/\s+/g, ' ').trim();
+      const idx = nomNorm.indexOf(mNorm);
+      if (idx !== -1) {
+        result.push(m === 'PDR + ATEL' ? 'PDR + Atel' : m);
+        // Supprimer la maladie trouvée du nom restant
+        nom = (nom.slice(0, idx) + nom.slice(idx + m.length))
+          .replace(/^\s*\+\s*|\s*\+\s*$/, '').trim();
+      }
+    }
+    // Ce qui reste → maladies non reconnues
+    if (nom && nom !== '+') {
+      nom.split('+').map(p => p.trim()).filter(Boolean).forEach(p => result.push(p));
+    }
+    return result.length > 0 ? result : [maladieNom];
+  };
+
   const imageAppartientAClasse = (maladieNom, classeFiltre) => {
     if (!maladieNom || !classeFiltre) return false;
     const normaliser = (s) =>
@@ -449,12 +482,27 @@ const MesImages = () => {
   };
 
   /* ─── Handlers ─── */
-  const handleEditClick = (avi) => {
+  const handleEditClick = (avi, group) => {
     setSelectedImage(avi);
+    setSelectedGroup(group);
     setModalMode('edit');
-    setNewDiseaseName(avi.maladie_nom || 'OMA');
-    setNewDiseaseType(avi.stade_nom  || 'Standard');
     setPassword(''); setError(''); setStep(1);
+
+    // Pré-remplir les maladies existantes dans multiSelections
+    const maladies = extractMaladiesFromDiag(avi.maladie_nom || '');
+    const stades   = (avi.stade_nom || '').split('/').map(s => s.trim());
+    const initSels = {};
+    maladies.forEach((m, i) => { initSels[m] = { stage: stades[i] || 'Standard' }; });
+    setMultiSelections(initSels);
+
+    // Pré-remplir les contours existants
+    const hash = group.image_hash;
+    const existingAnnot = annotationsMap[`${hash}__${currentUserId}`]?.annotation_details;
+    const existingContours = extractContours(existingAnnot);
+    const initContours = {};
+    existingContours.forEach(c => { if (c.maladie) initContours[c.maladie] = c; });
+    setContoursParMaladie(initContours);
+
     setShowModal(true);
   };
 
@@ -774,14 +822,48 @@ const MesImages = () => {
 
   const handleConfirmAction = async () => {
     setError('');
+    const keys = Object.keys(multiSelections);
+    if (keys.length === 0) { setError('Sélectionnez au moins une pathologie.'); return; }
     const isValid = await verifyPassword(password.trim());
     if (!isValid) { setError('Mot de passe incorrect.'); return; }
     try {
+      const maladieNom = keys.join(' + ');
+      const stadeNom   = keys.map(k => multiSelections[k].stage || 'Standard').join(' / ');
+
+      // Mettre à jour le diagnostic
       const { error } = await supabase.from('categories_diagnostics')
-        .update({ maladie_nom: newDiseaseName, stade_nom: newDiseaseType })
+        .update({ maladie_nom: maladieNom, stade_nom: stadeNom })
         .eq('id', selectedImage.id);
       if (error) throw error;
+
+      // Mettre à jour les contours si modifiés
+      const hash = selectedGroup?.image_hash || selectedImage.image_hash;
+      const contours = Object.entries(contoursParMaladie)
+        .filter(([, c]) => c?.points_normalized?.length >= 3)
+        .map(([maladie, c]) => ({
+          maladie,
+          color:             MALADIE_COLORS[maladie] || c.color || '#22d3ee',
+          points_normalized: c.points_normalized,
+          points_pixels:     c.points_pixels,
+          bounding_box:      c.bounding_box,
+          created_at:        c.created_at || new Date().toISOString(),
+        }));
+
+      if (contours.length > 0 && hash) {
+        const diagId = await getLatestDiagnosticIdForUser(hash, currentUserId);
+        await supabase.from('annotations_maladie')
+          .upsert([{
+            diagnostic_id:      diagId,
+            image_hash:         hash,
+            utilisateur_id:     currentUserId,
+            image_original_url: selectedGroup?.image_url || '',
+            annotation_details: { contours },
+          }], { onConflict: 'image_hash,utilisateur_id' });
+      }
+
       setShowModal(false);
+      setMultiSelections({});
+      setContoursParMaladie({});
       fetchData();
     } catch (err) {
       console.error(err);
@@ -949,7 +1031,7 @@ const MesImages = () => {
                   // Annotation du médecin courant (pour savoir s'il a tracé le sien)
                   const myAnnotKey   = `${group.image_hash}__${currentUserId}`;
                   const myAnnotation = annotationsMap[myAnnotKey]?.annotation_details || null;
-                  const hasContour   = allGroupAnnotations.some(a => a?.points_normalized?.length >= 3);
+                  const hasContour   = allGroupAnnotations.some(a => extractContours(a).length > 0);
                   return (
                     <div
                       className={`relative h-56 ${isMyDiag ? 'cursor-pointer group/img' : ''}`}
@@ -1006,7 +1088,7 @@ const MesImages = () => {
                         </div>
                         {avi.utilisateur_id === currentUserId && (
                           <div className="flex gap-1">
-                            <button onClick={() => handleEditClick(avi)}   className="p-2 text-slate-400 hover:text-cyan-400"><Edit  size={14}/></button>
+                            <button onClick={() => handleEditClick(avi, group)} className="p-2 text-slate-400 hover:text-cyan-400"><Edit size={14}/></button>
                             <button onClick={() => handleDeleteClick(avi)} className="p-2 text-red-400/50 hover:text-red-500"><Trash2 size={14}/></button>
                           </div>
                         )}
@@ -1201,35 +1283,77 @@ const MesImages = () => {
                       </div>
                     </div>
                   ) : (
-                    <>
+                    // ── Mode édition : même UI que "Donner mon avis" ──
+                    <div className="space-y-4">
+                      {/* Contours par maladie */}
                       <div className="space-y-2">
-                        <label className="text-[10px] font-black text-slate-500 uppercase ml-2">Pathologie</label>
-                        <select
-                          value={newDiseaseName}
-                          onChange={e => { setNewDiseaseName(e.target.value); setNewDiseaseType('Standard'); }}
-                          className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-white"
-                        >
-                          {categoryOptions.map(opt => <option key={opt.name} value={opt.name}>{opt.fullName}</option>)}
-                        </select>
+                        <p className="text-[10px] font-black text-slate-400 uppercase ml-1">Contours par maladie</p>
+                        {Object.keys(multiSelections).length === 0 ? (
+                          <p className="text-[10px] text-slate-500 italic px-1">Cochez d'abord une pathologie ci-dessous</p>
+                        ) : Object.keys(multiSelections).map(maladie => {
+                          const color  = MALADIE_COLORS[maladie] || '#22d3ee';
+                          const traced = !!contoursParMaladie[maladie];
+                          return (
+                            <div key={maladie} className="flex items-center justify-between gap-3 p-3 rounded-2xl border"
+                              style={{ borderColor: `${color}60`, backgroundColor: `${color}15` }}>
+                              <div className="flex items-center gap-2">
+                                <div className="w-3 h-3 rounded-full" style={{ backgroundColor: color }}/>
+                                <div>
+                                  <p className="text-[10px] font-bold uppercase" style={{ color }}>{maladie}</p>
+                                  <p className="text-[9px] text-slate-400">{traced ? '✓ Contour tracé' : 'Non tracé'}</p>
+                                </div>
+                              </div>
+                              <button onClick={() => openAnnotationModal(maladie)}
+                                className="px-3 py-1.5 text-[10px] font-black uppercase rounded-xl text-white hover:opacity-80"
+                                style={{ backgroundColor: color }}>
+                                {traced ? 'Modifier' : 'Tracer'}
+                              </button>
+                            </div>
+                          );
+                        })}
                       </div>
-                      {currentCategory?.options.length > 0 && (
-                        <div className="space-y-2">
-                          <label className="text-[10px] font-black text-slate-500 uppercase ml-2">Stade / Type</label>
-                          <select
-                            value={newDiseaseType}
-                            onChange={e => setNewDiseaseType(e.target.value)}
-                            className="w-full bg-slate-900 p-4 rounded-2xl border border-white/5 outline-none text-white"
-                          >
-                            <option value="Standard">Standard</option>
-                            {currentCategory.options.map(o => <option key={o} value={o}>{o}</option>)}
-                          </select>
-                        </div>
-                      )}
-                    </>
+                      {/* Checkboxes maladies */}
+                      <div className="space-y-2 overflow-y-auto max-h-[220px] pr-1 custom-scrollbar">
+                        {categoryOptions.map(cat => {
+                          const isChecked = !!multiSelections[cat.name];
+                          const icons = { OMA:'🔴', OSM:'🟡', Perfo:'🔵', Chole:'🟣', 'PDR + Atel':'🟠', Normal:'🟢', Autre:'⚪' };
+                          return (
+                            <div key={cat.name} className={`rounded-2xl border transition-all ${isChecked ? 'border-cyan-400 bg-cyan-400/10' : 'border-white/5 bg-white/5'}`}>
+                              <div className="flex items-center gap-3 p-3">
+                                <span className="text-lg">{icons[cat.name]}</span>
+                                <div className="flex-1">
+                                  <p className="text-xs font-bold">{cat.name}</p>
+                                  <p className="text-[9px] text-slate-400 uppercase">{cat.fullName}</p>
+                                </div>
+                                <input type="checkbox" className="w-5 h-5 accent-cyan-400"
+                                  checked={isChecked}
+                                  onChange={e => {
+                                    const s = { ...multiSelections };
+                                    if (e.target.checked) s[cat.name] = { stage: 'Standard' };
+                                    else { delete s[cat.name]; const c = { ...contoursParMaladie }; delete c[cat.name]; setContoursParMaladie(c); }
+                                    setMultiSelections(s);
+                                  }}
+                                />
+                              </div>
+                              {isChecked && cat.options.length > 0 && (
+                                <div className="px-3 pb-3">
+                                  <select className="w-full bg-slate-900 text-[10px] p-2.5 rounded-xl border border-cyan-500/30 text-white outline-none"
+                                    value={multiSelections[cat.name].stage}
+                                    onChange={e => setMultiSelections({ ...multiSelections, [cat.name]: { stage: e.target.value } })}>
+                                    <option value="Standard">Stade...</option>
+                                    {cat.options.map(o => <option key={o} value={o}>{o}</option>)}
+                                  </select>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   )}
 
                   <button
-                    onClick={() => { if (modalMode === 'add') handleAddAvis(); else setStep(2); }}
+                    onClick={() => { if (modalMode === 'add') handleAddAvis(); else { const keys = Object.keys(multiSelections); if (keys.length === 0) { setError('Sélectionnez au moins une pathologie.'); return; } setStep(2); } }}
                     className="w-full py-5 bg-cyan-600 rounded-2xl font-black uppercase text-xs tracking-widest hover:bg-cyan-500 transition-all"
                   >
                     {modalMode === 'add' ? 'Valider mon avis' : 'Continuer'}
@@ -1269,8 +1393,11 @@ const MesImages = () => {
           .filter(a => a.image_hash === hash)
           .map(a => a.annotation_details)
           .filter(Boolean);
-        const points       = allAnnotations.flatMap(a => a?.points_normalized || []);
-        const hasContour   = allAnnotations.some(a => (a?.points_normalized?.length || 0) >= 3);
+        const allContours  = allAnnotations.flatMap(a => extractContours(a));
+        const points       = allContours.flatMap(c => c.points_normalized || []);
+        const hasContour   = allContours.some(c => (c.points_normalized?.length || 0) >= 3);
+        // DEBUG
+        console.log('🔍 MODALE:', { hash: hash.slice(0,8), mapSize: Object.keys(annotationsMap).length, allAnnotCount: allAnnotations.length, allContourCount: allContours.length, hasContour, keys: Object.keys(annotationsMap).filter(k => k.startsWith(hash.slice(0,8))) });
         const imgUrl       = viewContourGroup.image_url;
         const myAvi        = viewContourGroup.avis.find(a => a.utilisateur_id === currentUserId);
 
@@ -1291,7 +1418,7 @@ const MesImages = () => {
                       {myAvi?.stade_nom && myAvi.stade_nom !== 'Standard' ? ` (${myAvi.stade_nom})` : ''}
                     </p>
                     <p className="text-[10px] text-slate-400 mt-0.5 uppercase">
-                      {hasContour ? `${points.length} points · Contour tracé` : 'Aucun contour pour cette image'}
+                      {hasContour ? `${allContours.length} contour${allContours.length > 1 ? 's' : ''} · ${allContours.reduce((s,c) => s + (c.points_normalized?.length||0), 0)} points` : 'Aucun contour pour cette image'}
                     </p>
                   </div>
                 </div>
@@ -1320,20 +1447,18 @@ const MesImages = () => {
               {hasContour && (() => {
                 const COLORS = ['#22d3ee', '#f59e0b', '#a78bfa', '#34d399', '#f87171'];
                 const annotEntries = Object.values(annotationsMap).filter(a => a.image_hash === hash);
+                  const legendContours = annotEntries.flatMap(a => extractContours(a.annotation_details));
                 return (
                   <div className="px-6 py-3 border-t border-white/5 flex flex-wrap gap-3">
-                    {annotEntries.map((a, i) => {
-                      const doc = viewContourGroup.avis.find(v => v.utilisateur_id === a.utilisateur_id);
-                      return (
-                        <div key={i} className="flex items-center gap-1.5">
-                          <div className="w-3 h-3 rounded-full border-2 border-white/30"
-                               style={{ backgroundColor: COLORS[i % COLORS.length] }}/>
+                    {legendContours.map((c, i) => (
+                      <div key={i} className="flex items-center gap-1.5">
+                        <div className="w-3 h-3 rounded-full border-2 border-white/30"
+                             style={{ backgroundColor: c.color || COLORS[i % COLORS.length] }}/>
                           <span className="text-[10px] text-slate-400">
-                            {doc ? `Dr. ${doc.nom_medecin_diagnostiqueur}` : 'Médecin'}
+                            {c.maladie || 'Contour'}
                           </span>
                         </div>
-                      );
-                    })}
+                    ))}
                   </div>
                 );
               })()}
@@ -1344,8 +1469,8 @@ const MesImages = () => {
                   const myAnnotData  = annotationsMap[`${hash}__${currentUserId}`]?.annotation_details;
                   const myContours   = extractContours(myAnnotData);
                   // Maladies diagnostiquées par le médecin courant sur cette image
-                  const maladies = (myAvi?.maladie_nom || '')
-                    .split('+').map(m => m.trim()).filter(Boolean);
+                  // Extraire les maladies individuelles pour les boutons de tracé
+                  const maladies = extractMaladiesFromDiag(myAvi?.maladie_nom || '');
                   const targets = maladies.length > 0 ? maladies : [null];
                   return (
                     <>
