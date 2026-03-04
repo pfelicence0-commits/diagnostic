@@ -4,6 +4,7 @@ import GlobalMenu from '../components/GlobalMenu';
 import AnnotationCanvas from '../components/AnnotationCanvas';
 import { supabase } from '../supabaseClient'; 
 import UTIF from 'utif';
+import { client } from "@gradio/client"; 
 
 const categoryOptions = [
   { name: 'OMA', fullName: 'Otite Moyenne Aiguë', options: ['Congestive', 'Suppurée', 'Perforée'], icon: '🔴', color: '#ef4444' },
@@ -37,6 +38,8 @@ export default function Accueil() {
   const [annotationPreviewUrl, setAnnotationPreviewUrl] = useState('');
   const [autreDescription, setAutreDescription] = useState('');
 
+  const [iaSuggestions, setIaSuggestions] = useState(null);
+  const [isAnalysing, setIsAnalysing] = useState(false);
   useEffect(() => {
     const initSession = async () => {
       const storedUser = localStorage.getItem('user');
@@ -444,7 +447,44 @@ export default function Accueil() {
       setIsSaving(false);
     }
   };
+  const interrogerIA = async () => {
+    if (!selectedFile) return;
+    setIsAnalysing(true);
+    try {
+      const hf = await client("pfelicence/tympan-classifier");
+      const result = await hf.predict("/predict", [selectedFile]);
+      
+      console.log("Données reçues de l'IA:", result.data[0]); // Pour déboguer dans la console F12
 
+      let scores = [];
+      const dataRaw = result.data[0];
+
+      // SI GRADIO RENVOIE UN TABLEAU (Format standard Label)
+      if (Array.isArray(dataRaw.confidences)) {
+        scores = dataRaw.confidences.map(item => ({
+          label: item.label,
+          score: item.confidence
+        }));
+      } 
+      // SI GRADIO RENVOIE UN OBJET DIRECT { "Normal": 0.9 }
+      else {
+        scores = Object.entries(dataRaw).map(([key, value]) => ({
+          label: key,
+          score: value
+        }));
+      }
+
+      // Tri par score décroissant
+      scores.sort((a, b) => b.score - a.score);
+
+      setIaSuggestions(scores);
+    } catch (err) {
+      console.error("Erreur IA:", err);
+      setSaveMessage("❌ Erreur de connexion à l'IA");
+    } finally {
+      setIsAnalysing(false);
+    }
+  };
   const selectedDiseases = Object.keys(selections);
   const currentItemIsAlreadyUploaded = currentIndex !== null && fileQueue[currentIndex]?.status === 'uploaded';
 
@@ -576,6 +616,41 @@ export default function Accueil() {
         <div className="flex-1 flex gap-6 min-h-0 overflow-hidden">
 
           {/* ── DIAGNOSTIC ── */}
+          {/* --- BLOC ASSISTANCE IA --- */}
+          <div className="mb-4 p-4 bg-cyan-500/10 border border-cyan-500/30 rounded-2xl">
+            <div className="flex justify-between items-center mb-3">
+              <h4 className="text-[10px] font-bold text-cyan-400 uppercase">Assistance IA</h4>
+              <button 
+                onClick={interrogerIA}
+                disabled={isAnalysing || !selectedFile}
+                className="text-[9px] bg-cyan-600 hover:bg-cyan-500 px-3 py-1 rounded-full transition-colors disabled:opacity-50"
+              >
+                {isAnalysing ? "Analyse..." : "Lancer l'IA"}
+              </button>
+            </div>
+
+            {iaSuggestions ? (
+              <div className="space-y-2">
+                {iaSuggestions.slice(0, 3).map((s, i) => (
+                  <div key={i}>
+                    <div className="flex justify-between text-[10px] mb-1">
+                      <span>{s.label}</span>
+                      <span className="font-mono">{(s.score * 100).toFixed(1)}%</span>
+                    </div>
+                    <div className="w-full bg-slate-700 h-1 rounded-full">
+                      <div 
+                        className="bg-cyan-400 h-1 rounded-full transition-all duration-1000" 
+                        style={{ width: `${s.score * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-[9px] text-slate-500 italic text-center">Cliquez pour obtenir une suggestion</p>
+            )}
+          </div>
+          {/* --- FIN BLOC ASSISTANCE IA --- */}
           <div className="w-[360px] flex-shrink-0 flex flex-col bg-slate-800/30 rounded-3xl border border-white/10 overflow-hidden">
             <div className="px-6 pt-6 pb-2 flex-shrink-0">
               <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Diagnostic Médical</h3>
